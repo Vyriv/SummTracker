@@ -288,19 +288,54 @@ async function pollGameState() {
 function startLevelPolling(initialPlayers) {
   stopLevelPolling();
   const lastUltLevel = initialPlayers.map(p => p.ultLevel);
+  let lastMode = null;
+  const lastCooldownSignature = initialPlayers.map(player => JSON.stringify({
+    spell1Cd: player.spell1.cd,
+    spell2Cd: player.spell2.cd,
+    ultCds: player.ultCds,
+  }));
 
   levelPollInterval = setInterval(async () => {
     try {
-      const players = await getAllPlayers();
+      const [players, gameflowSession, liveGameData] = await Promise.all([
+        getAllPlayers(),
+        getGameflowSession(),
+        getAllGameData().catch(() => null),
+      ]);
+      const mode = detectGameMode({ gameflowSession, liveGameData });
       const updates = [];
+      const cooldownUpdates = [];
       players.forEach((p, i) => {
         const ultLevel = getUltLevelFromChampLevel(p.level ?? 1);
+        const spell1 = applySummonerSpellHaste(
+          getSummonerSpell(spellIdFromRaw(p.summonerSpells?.summonerSpellOne)),
+          p.items,
+          mode
+        );
+        const spell2 = applySummonerSpellHaste(
+          getSummonerSpell(spellIdFromRaw(p.summonerSpells?.summonerSpellTwo)),
+          p.items,
+          mode
+        );
+        const ultCds = applyUltItemHaste(getUltCooldowns(p.championName), p.items);
+        const signature = JSON.stringify({ spell1Cd: spell1.cd, spell2Cd: spell2.cd, ultCds });
         if (ultLevel !== lastUltLevel[i]) {
           lastUltLevel[i] = ultLevel;
           updates.push({ playerIndex: i, champLevel: p.level ?? 1, ultLevel });
         }
+        if (lastMode !== mode || signature !== lastCooldownSignature[i]) {
+          lastCooldownSignature[i] = signature;
+          cooldownUpdates.push({
+            playerIndex: i,
+            spell1Cd: spell1.cd,
+            spell2Cd: spell2.cd,
+            ultCds,
+          });
+        }
       });
       if (updates.length > 0) win.webContents.send('player-levels', updates);
+      if (cooldownUpdates.length > 0) win.webContents.send('player-cooldowns', cooldownUpdates);
+      lastMode = mode;
     } catch {}
   }, 5000);
 }

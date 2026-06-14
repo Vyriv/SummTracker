@@ -251,6 +251,7 @@ function buildPlayerRow(player, index, enemyIndex = null) {
   const ultBtn = document.createElement('div');
   ultBtn.className = 'spell-btn ult-btn';
   ultBtn.dataset.cdKey = cdKey(index, 'ult');
+  ultBtn.dataset.playerIndex = index;
   ultBtn.dataset.ultCds = JSON.stringify(player.ultCds);
   ultBtn.dataset.baseCd = player.ultCds[Math.max(0, (player.ultLevel || 1) - 1)] || player.ultCds[0];
   ultBtn.title = `${player.championName} Ultimate`;
@@ -332,6 +333,8 @@ function buildPlayerRow(player, index, enemyIndex = null) {
 function buildSpellButton(playerIndex, type, spell, baseCd, enemyIndex = null) {
   const btn = document.createElement('div');
   btn.className = 'spell-btn';
+  btn.dataset.playerIndex = playerIndex;
+  btn.dataset.spellType = type;
   btn.dataset.cdKey = cdKey(playerIndex, type);
   btn.dataset.baseCd = baseCd;
   btn.title = `${spell.name} (${baseCd}s)`;
@@ -503,6 +506,31 @@ window.overlay.onPlayerLevels((updates) => {
     const pips = document.querySelector(`.ult-level[data-player-index="${playerIndex}"]`);
     if (pips) {
       pips.dispatchEvent(new CustomEvent('auto-level', { detail: { ultLevel } }));
+    }
+  });
+});
+
+window.overlay.onPlayerCooldowns((updates) => {
+  updates.forEach(({ playerIndex, spell1Cd, spell2Cd, ultCds }) => {
+    const spell1Btn = document.querySelector(`.spell-btn[data-player-index="${playerIndex}"][data-spell-type="spell1"]`);
+    if (spell1Btn) {
+      spell1Btn.dataset.baseCd = spell1Cd;
+      spell1Btn.title = `${spell1Btn.querySelector('img')?.alt || 'Spell'} (${spell1Cd}s)`;
+    }
+
+    const spell2Btn = document.querySelector(`.spell-btn[data-player-index="${playerIndex}"][data-spell-type="spell2"]`);
+    if (spell2Btn) {
+      spell2Btn.dataset.baseCd = spell2Cd;
+      spell2Btn.title = `${spell2Btn.querySelector('img')?.alt || 'Spell'} (${spell2Cd}s)`;
+    }
+
+    const ultBtn = document.querySelector(`.ult-btn[data-player-index="${playerIndex}"]`);
+    if (ultBtn && Array.isArray(ultCds)) {
+      ultBtn.dataset.ultCds = JSON.stringify(ultCds);
+      const pips = document.querySelector(`.ult-level[data-player-index="${playerIndex}"]`);
+      const activePips = pips ? pips.querySelectorAll('.ult-pip.active').length : 0;
+      const ultLevel = activePips || 1;
+      ultBtn.dataset.baseCd = ultCds[Math.max(0, ultLevel - 1)] || ultCds[0];
     }
   });
 });
