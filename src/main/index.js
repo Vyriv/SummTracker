@@ -6,6 +6,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { isClientRunning, getChampSelectSession, getGameflowSession } = require('./lcu');
 const { getAllPlayers, getAllGameData, isGameRunning, getActivePlayer } = require('./live-game');
 const { getSummonerSpell, getUltCooldowns, getUltLevelFromChampLevel, applyUltItemHaste, applySummonerSpellHaste, initCooldowns } = require('./cooldowns');
+const { getForegroundWindowInfo, isLeagueGameWindow } = require('./windows');
 
 const COLLAPSED_HEIGHT = 32;
 const NATURAL_WIDTH = 320;
@@ -19,6 +20,7 @@ let win;
 let tray;
 let pollInterval;
 let levelPollInterval;
+let windowLockInterval;
 let gameState = 'idle';
 let isCollapsed = false;
 let expandedBounds = loadBounds();
@@ -52,6 +54,7 @@ function createWindow() {
     transparent: true,
     frame: false,
     alwaysOnTop: true,
+    focusable: false,
     resizable: true,
     skipTaskbar: true,
     show: false,
@@ -229,10 +232,11 @@ async function pollGameState() {
       } catch {}
 
       gameState = 'in-game';
-      win.show();
+      win.showInactive();
       win.webContents.send('game-data', { state: 'in-game', players: mapped, ownTeam, mode });
       await syncToMatchRoom(mapped, ownTeam);
       startLevelPolling(mapped);
+      startWindowLock();
     } catch (e) {
     }
     return;
@@ -244,6 +248,7 @@ async function pollGameState() {
       await syncToMatchRoom(null, null);
       win.hide();
       stopLevelPolling();
+      stopWindowLock();
       return;
     }
 
@@ -254,6 +259,7 @@ async function pollGameState() {
       await syncToMatchRoom(null, null);
       win.hide();
       stopLevelPolling();
+      stopWindowLock();
       return;
     }
 
@@ -272,6 +278,7 @@ async function pollGameState() {
           await syncToMatchRoom(null, null);
           win.hide();
           stopLevelPolling();
+          stopWindowLock();
         }
       } catch {
         if (gameState !== 'idle') {
@@ -279,6 +286,7 @@ async function pollGameState() {
           await syncToMatchRoom(null, null);
           win.hide();
           stopLevelPolling();
+          stopWindowLock();
         }
       }
     }
@@ -342,6 +350,29 @@ function startLevelPolling(initialPlayers) {
 
 function stopLevelPolling() {
   if (levelPollInterval) { clearInterval(levelPollInterval); levelPollInterval = null; }
+}
+
+function startWindowLock() {
+  stopWindowLock();
+
+  windowLockInterval = setInterval(async () => {
+    if (!win || win.isDestroyed() || gameState !== 'in-game') return;
+
+    const foreground = await getForegroundWindowInfo();
+    if (isLeagueGameWindow(foreground)) {
+      if (!win.isVisible()) win.show();
+      return;
+    }
+
+    if (win.isVisible()) win.hide();
+  }, 1000);
+}
+
+function stopWindowLock() {
+  if (windowLockInterval) {
+    clearInterval(windowLockInterval);
+    windowLockInterval = null;
+  }
 }
 
 function spellIdFromRaw(spellData) {
@@ -612,6 +643,7 @@ app.on('will-quit', () => {
   app.isQuitting = true;
   clearInterval(pollInterval);
   stopLevelPolling();
+  stopWindowLock();
   if (syncChannel) supabase.removeChannel(syncChannel);
 });
 
