@@ -1,6 +1,8 @@
 const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 const { isClientRunning, getChampSelectSession } = require('./lcu');
 const { getAllPlayers, isGameRunning, getActivePlayer } = require('./live-game');
 const { getSummonerSpell, getUltCooldowns, getUltLevelFromChampLevel, initCooldowns } = require('./cooldowns');
@@ -9,6 +11,9 @@ const COLLAPSED_HEIGHT = 32;
 const NATURAL_WIDTH = 320;
 const BOUNDS_FILE    = path.join(app.getPath('userData'), 'bounds.json');
 const SETTINGS_FILE  = path.join(app.getPath('userData'), 'settings.json');
+const SUPABASE_URL = 'https://sjodltcylcxvauvgabot.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_ex94Isy1_u-qzXJWJEqeQg_9nhGkohm';
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let win;
 let tray;
@@ -17,6 +22,8 @@ let levelPollInterval;
 let gameState = 'idle';
 let isCollapsed = false;
 let expandedBounds = loadBounds();
+let syncRoomId = null;
+let syncChannel = null;
 
 function loadBounds() {
   try {
@@ -91,6 +98,47 @@ ipcMain.on('save-settings', (_, settings) => {
   try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings)); } catch {}
 });
 
+ipcMain.on('sync-cooldown-event', async (_, payload) => {
+  if (!syncRoomId || !payload?.spell || payload.enemyIndex == null) return;
+  const match = {
+    room_id: syncRoomId,
+    enemy_index: payload.enemyIndex,
+    spell: payload.spell,
+  };
+
+  const { data: existing } = await supabase
+    .from('cooldowns')
+    .select('id')
+    .match(match)
+    .order('updated_at', { ascending: false })
+    .limit(1);
+
+  const nextValues = payload.action === 'start'
+    ? {
+        ...match,
+        started_at: payload.startedAt,
+        duration_ms: payload.durationMs,
+        updated_at: new Date().toISOString(),
+      }
+    : {
+        started_at: 0,
+        duration_ms: 0,
+        updated_at: new Date().toISOString(),
+      };
+
+  if (existing?.length) {
+    await supabase
+      .from('cooldowns')
+      .update(nextValues)
+      .eq('id', existing[0].id);
+    return;
+  }
+
+  if (payload.action === 'start') {
+    await supabase.from('cooldowns').insert(nextValues);
+  }
+});
+
 let currentNaturalHeight = null;
 let applyingHeight = false;
 
@@ -162,6 +210,7 @@ async function pollGameState() {
       gameState = 'in-game';
       win.show();
       win.webContents.send('game-data', { state: 'in-game', players: mapped, ownTeam });
+      await syncToMatchRoom(mapped, ownTeam);
       startLevelPolling(mapped);
     } catch (e) {
     }
@@ -171,6 +220,7 @@ async function pollGameState() {
   if (!gameRunning) {
     if (gameState === 'in-game') {
       gameState = 'idle';
+      await syncToMatchRoom(null, null);
       win.hide();
       stopLevelPolling();
       return;
@@ -180,6 +230,7 @@ async function pollGameState() {
 
     if (!clientUp && gameState !== 'idle') {
       gameState = 'idle';
+      await syncToMatchRoom(null, null);
       win.hide();
       stopLevelPolling();
       return;
@@ -193,12 +244,14 @@ async function pollGameState() {
           win.webContents.send('game-data', { state: 'champ-select', session });
         } else if (!session && gameState === 'champ-select') {
           gameState = 'idle';
+          await syncToMatchRoom(null, null);
           win.hide();
           stopLevelPolling();
         }
       } catch {
         if (gameState !== 'idle') {
           gameState = 'idle';
+          await syncToMatchRoom(null, null);
           win.hide();
           stopLevelPolling();
         }
@@ -241,6 +294,97 @@ function ddKeyFromRaw(rawChampionName, fallback) {
   const match = rawChampionName?.match(/game_character_displayname_(.+)/);
   if (match) return match[1];
   return (fallback || '').replace(/[' .]/g, '');
+}
+
+function normalizePlayerId(player) {
+  return `${player.riotIdGameName || ''}|${player.summonerName || ''}`.trim().toLowerCase();
+}
+
+function computeRoomId(players, ownTeam) {
+  if (!players || !ownTeam) return null;
+
+  const allies = players
+    .filter(player => player.team === ownTeam)
+    .map(normalizePlayerId)
+    .filter(Boolean)
+    .sort();
+
+  if (allies.length !== 5) return null;
+
+  return crypto
+    .createHash('sha256')
+    .update(allies.join('||'))
+    .digest('hex')
+    .slice(0, 24);
+}
+
+function forwardSyncRow(action, row) {
+  if (!row || !win || win.isDestroyed()) return;
+
+  win.webContents.send('sync-cooldown-event', {
+    action,
+    enemyIndex: row.enemy_index,
+    spell: row.spell,
+    startedAt: row.started_at,
+    durationMs: row.duration_ms,
+  });
+}
+
+async function sendSyncSnapshot(roomId) {
+  if (!roomId || !win || win.isDestroyed()) return;
+
+  const { data, error } = await supabase
+    .from('cooldowns')
+    .select('enemy_index, spell, started_at, duration_ms')
+    .eq('room_id', roomId)
+    .gt('duration_ms', 0);
+
+  if (error) return;
+
+  win.webContents.send('sync-cooldown-snapshot', data.map(row => ({
+    action: 'start',
+    enemyIndex: row.enemy_index,
+    spell: row.spell,
+    startedAt: row.started_at,
+    durationMs: row.duration_ms,
+  })));
+}
+
+async function syncToMatchRoom(players, ownTeam) {
+  const nextRoomId = computeRoomId(players, ownTeam);
+  if (nextRoomId === syncRoomId) return;
+
+  if (syncChannel) {
+    await supabase.removeChannel(syncChannel);
+    syncChannel = null;
+  }
+
+  syncRoomId = nextRoomId;
+
+  if (!syncRoomId) {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('sync-cooldown-snapshot', []);
+    }
+    return;
+  }
+
+  await sendSyncSnapshot(syncRoomId);
+
+  syncChannel = supabase
+    .channel(`cooldowns:${syncRoomId}`)
+    .on('postgres_changes', {
+      event: 'INSERT',
+      schema: 'public',
+      table: 'cooldowns',
+      filter: `room_id=eq.${syncRoomId}`,
+    }, payload => forwardSyncRow('start', payload.new))
+    .on('postgres_changes', {
+      event: 'UPDATE',
+      schema: 'public',
+      table: 'cooldowns',
+      filter: `room_id=eq.${syncRoomId}`,
+    }, payload => forwardSyncRow(payload.new.duration_ms > 0 ? 'start' : 'cancel', payload.new))
+    .subscribe();
 }
 
 ipcMain.on('ult-level-changed', (event, { playerIndex, level }) => {
@@ -309,6 +453,7 @@ app.on('will-quit', () => {
   app.isQuitting = true;
   clearInterval(pollInterval);
   stopLevelPolling();
+  if (syncChannel) supabase.removeChannel(syncChannel);
 });
 
 app.on('window-all-closed', () => app.quit());

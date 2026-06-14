@@ -11,6 +11,8 @@ const DEFAULT_SETTINGS = {
 let settings = { ...DEFAULT_SETTINGS };
 
 let ownTeam = null;
+let enemyPlayerIndices = [];
+let pendingSyncEvents = [];
 
 function saveSettings() {
   window.overlay.saveSettings(settings);
@@ -124,13 +126,13 @@ function cdKey(playerIndex, type) {
   return `${playerIndex}_${type}`;
 }
 
-function startCooldown(playerIndex, type, seconds) {
+function startCooldown(playerIndex, type, seconds, startedAt = Date.now()) {
   const key = cdKey(playerIndex, type);
   if (timers[key]) {
     clearInterval(timers[key].interval);
   }
 
-  const endsAt = Date.now() + seconds * 1000;
+  const endsAt = startedAt + seconds * 1000;
   const btn = document.querySelector(`[data-cd-key="${key}"]`);
   if (!btn) return;
 
@@ -207,7 +209,7 @@ function setUltIcon(img, ddKey) {
     });
 }
 
-function buildPlayerRow(player, index) {
+function buildPlayerRow(player, index, enemyIndex = null) {
   const row = document.createElement('div');
   row.className = 'player-row';
   row.dataset.playerIndex = index;
@@ -236,9 +238,9 @@ function buildPlayerRow(player, index) {
   spells.className = 'spells';
 
   // Summoner spell 1
-  spells.appendChild(buildSpellButton(index, 'spell1', player.spell1, player.spell1.cd));
+  spells.appendChild(buildSpellButton(index, 'spell1', player.spell1, player.spell1.cd, enemyIndex));
   // Summoner spell 2
-  spells.appendChild(buildSpellButton(index, 'spell2', player.spell2, player.spell2.cd));
+  spells.appendChild(buildSpellButton(index, 'spell2', player.spell2, player.spell2.cd, enemyIndex));
 
   // Ult button + level pips
   const ultGroup = document.createElement('div');
@@ -269,9 +271,21 @@ function buildPlayerRow(player, index) {
     const key = cdKey(index, 'ult');
     if (timers[key]) {
       cancelCooldown(index, 'ult');
+      if (enemyIndex != null) {
+        window.overlay.sendSyncCooldownEvent({ action: 'cancel', enemyIndex, spell: 'ult' });
+      }
     } else {
       const cd = Number(ultBtn.dataset.baseCd) || 120;
       startCooldown(index, 'ult', cd);
+      if (enemyIndex != null) {
+        window.overlay.sendSyncCooldownEvent({
+          action: 'start',
+          enemyIndex,
+          spell: 'ult',
+          startedAt: Date.now(),
+          durationMs: Math.round(cd * 1000),
+        });
+      }
     }
   });
 
@@ -315,7 +329,7 @@ function buildPlayerRow(player, index) {
   return row;
 }
 
-function buildSpellButton(playerIndex, type, spell, baseCd) {
+function buildSpellButton(playerIndex, type, spell, baseCd, enemyIndex = null) {
   const btn = document.createElement('div');
   btn.className = 'spell-btn';
   btn.dataset.cdKey = cdKey(playerIndex, type);
@@ -345,8 +359,20 @@ function buildSpellButton(playerIndex, type, spell, baseCd) {
     const key = cdKey(playerIndex, type);
     if (timers[key]) {
       cancelCooldown(playerIndex, type);
+      if (enemyIndex != null) {
+        window.overlay.sendSyncCooldownEvent({ action: 'cancel', enemyIndex, spell: type });
+      }
     } else {
       startCooldown(playerIndex, type, baseCd);
+      if (enemyIndex != null) {
+        window.overlay.sendSyncCooldownEvent({
+          action: 'start',
+          enemyIndex,
+          spell: type,
+          startedAt: Date.now(),
+          durationMs: Math.round(baseCd * 1000),
+        });
+      }
     }
   });
 
@@ -355,6 +381,7 @@ function buildSpellButton(playerIndex, type, spell, baseCd) {
 
 function renderPlayers(players) {
   resetAllCooldowns();
+  enemyPlayerIndices = [];
 
   const allyTeamId  = ownTeam || 'ORDER';
   const enemyTeamId = allyTeamId === 'ORDER' ? 'CHAOS' : 'ORDER';
@@ -385,16 +412,54 @@ function renderPlayers(players) {
   gameScreen.insertBefore(allyEl, divider);
 
   players.forEach((player, i) => {
-    const row = buildPlayerRow(player, i);
-    if (player.team === allyTeamId) allyEl.appendChild(row);
-    else enemyEl.appendChild(row);
+    if (player.team === allyTeamId) {
+      allyEl.appendChild(buildPlayerRow(player, i));
+      return;
+    }
+
+    const enemyIndex = enemyPlayerIndices.length;
+    enemyPlayerIndices.push(i);
+    enemyEl.appendChild(buildPlayerRow(player, i, enemyIndex));
   });
+
+  flushPendingSyncEvents();
 }
 
 function showScreen(id) {
   currentScreen = id;
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || id !== 'idle-screen');
   document.getElementById('game-screen').classList.toggle('hidden', settingsOpen || id !== 'game-screen');
+}
+
+function applySyncCooldownEvent(event) {
+  if (!event || event.enemyIndex == null || !event.spell) return false;
+
+  const playerIndex = enemyPlayerIndices[event.enemyIndex];
+  if (playerIndex == null) return false;
+
+  if (event.action === 'cancel') {
+    cancelCooldown(playerIndex, event.spell);
+    return true;
+  }
+
+  if (event.action === 'start' && event.durationMs != null && event.startedAt != null) {
+    startCooldown(playerIndex, event.spell, event.durationMs / 1000, event.startedAt);
+    return true;
+  }
+
+  return false;
+}
+
+function queueOrApplySyncEvent(event) {
+  if (!applySyncCooldownEvent(event)) {
+    pendingSyncEvents.push(event);
+  }
+}
+
+function flushPendingSyncEvents() {
+  if (pendingSyncEvents.length === 0) return;
+
+  pendingSyncEvents = pendingSyncEvents.filter(event => !applySyncCooldownEvent(event));
 }
 
 // ── Titlebar controls ──
@@ -426,6 +491,8 @@ window.overlay.onGameData((data) => {
     syncGameHeight();
   } else {
     resetAllCooldowns();
+    enemyPlayerIndices = [];
+    pendingSyncEvents = [];
     showScreen('idle-screen');
   }
 });
@@ -438,4 +505,14 @@ window.overlay.onPlayerLevels((updates) => {
       pips.dispatchEvent(new CustomEvent('auto-level', { detail: { ultLevel } }));
     }
   });
+});
+
+window.overlay.onSyncCooldownEvent((event) => {
+  queueOrApplySyncEvent(event);
+});
+
+window.overlay.onSyncCooldownSnapshot((events) => {
+  resetAllCooldowns();
+  pendingSyncEvents = [];
+  events.forEach(event => queueOrApplySyncEvent(event));
 });
