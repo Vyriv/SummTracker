@@ -1,0 +1,386 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  user-select: none;
+}
+
+body {
+  background: transparent;
+  font-family: 'Segoe UI', sans-serif;
+  color: #e8d5a3;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
+}
+
+#app {
+  background: rgba(5, 8, 15, 0.82);
+  border: 1px solid rgba(200, 170, 90, 0.3);
+  border-radius: 8px;
+  backdrop-filter: blur(4px);
+  display: flex;
+  flex-direction: column;
+  width: 320px;
+  transform-origin: top left;
+}
+
+/* ── Titlebar (always visible, drag handle) ── */
+#titlebar {
+  -webkit-app-region: drag;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  border-bottom: 1px solid rgba(200, 170, 90, 0.2);
+  border-radius: 8px 8px 0 0;
+  background: rgba(200, 170, 90, 0.06);
+  flex-shrink: 0;
+}
+
+body.collapsed #titlebar {
+  border-bottom: none;
+  border-radius: 8px;
+}
+
+#titlebar-label {
+  flex: 1;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: rgba(200, 170, 90, 0.6);
+  pointer-events: none;
+}
+
+/* ── Titlebar buttons ── */
+#collapse-btn,
+#settings-btn,
+#close-btn {
+  -webkit-app-region: no-drag;
+  background: none;
+  border: none;
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(232, 213, 163, 0.5);
+  transition: color 0.15s, background 0.15s;
+}
+
+#collapse-btn {
+  padding: 5px 6px;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#settings-btn {
+  font-size: 13px;
+  padding: 3px 6px;
+}
+
+#settings-btn.active {
+  color: #c8aa5a;
+}
+
+#collapse-btn:hover,
+#settings-btn:hover,
+#close-btn:hover {
+  color: #e8d5a3;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+#close-btn {
+  font-size: 12px;
+  padding: 4px 6px;
+}
+
+#close-btn:hover {
+  color: #ff6b6b;
+}
+
+#collapse-btn span {
+  display: block;
+  width: 14px;
+  height: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  pointer-events: none;
+}
+
+/* ── Content area ── */
+#content {
+  padding: 6px 6px 8px;
+  overflow: hidden;
+}
+
+body.collapsed #content {
+  display: none;
+}
+
+/* ── Screens ── */
+.screen { width: 100%; }
+.hidden { display: none !important; }
+
+.waiting {
+  text-align: center;
+  color: #555;
+  font-size: 12px;
+  padding: 16px 0;
+}
+
+/* ── Team sections ── */
+.team-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+  padding-left: 4px;
+}
+.ally-label  { color: #4a9eff; }
+.enemy-label { color: #ff4a4a; }
+
+.divider {
+  height: 1px;
+  background: rgba(200, 170, 90, 0.2);
+  margin: 6px 0;
+}
+
+/* ── Player row ── */
+.player-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px;
+  border-radius: 4px;
+  margin-bottom: 2px;
+  transition: background 0.15s;
+}
+.player-row:hover {
+  background: rgba(255,255,255,0.04);
+}
+
+.champion-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  background: #1a1a2e;
+  border: 1px solid rgba(255,255,255,0.1);
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.player-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.player-name {
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #d4b97a;
+}
+
+.champion-name {
+  font-size: 9px;
+  color: #666;
+}
+
+/* ── Spell + Ult buttons ── */
+.spells {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.spell-btn {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 3px;
+  background: #111;
+  border: 1px solid rgba(255,255,255,0.12);
+  cursor: pointer;
+  overflow: hidden;
+  flex-shrink: 0;
+  transition: border-color 0.15s;
+}
+
+.spell-btn img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.spell-btn .cooldown-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.spell-btn.on-cooldown .cooldown-overlay { opacity: 1; }
+.spell-btn.on-cooldown { border-color: rgba(255, 80, 80, 0.6); }
+.spell-btn.ready { border-color: rgba(80, 200, 120, 0.5); }
+
+.spell-btn.ult-btn {
+  width: 32px;
+  height: 32px;
+  border-color: rgba(160, 120, 220, 0.5);
+}
+
+.spell-btn.ult-btn.on-cooldown { border-color: rgba(160, 80, 80, 0.6); }
+.spell-btn.ult-btn.ready {
+  border-color: rgba(160, 120, 220, 0.8);
+  box-shadow: 0 0 6px rgba(160, 120, 220, 0.4);
+}
+
+/* Ult level pips */
+.ult-level {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-left: 1px;
+}
+
+.ult-pip {
+  width: 4px;
+  height: 8px;
+  border-radius: 1px;
+  background: #333;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.ult-pip.active { background: #a078dc; }
+
+/* ── Settings panel ── */
+#settings-panel {
+  padding: 4px 2px;
+  /* fills same content area as game screen — no resize when switching */
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 4px;
+  border-bottom: 1px solid rgba(200, 170, 90, 0.08);
+}
+
+.setting-row:last-child { border-bottom: none; }
+
+.setting-label {
+  font-size: 11px;
+  color: #c8aa5a;
+}
+
+/* Toggle switch */
+.toggle {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.toggle input { display: none; }
+
+.slider {
+  position: absolute;
+  inset: 0;
+  background: #333;
+  border-radius: 18px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.slider::after {
+  content: '';
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  left: 3px;
+  top: 3px;
+  background: #888;
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.toggle input:checked + .slider { background: rgba(160, 120, 220, 0.3); }
+.toggle input:checked + .slider::after { transform: translateX(14px); background: #a078dc; }
+
+/* Format buttons */
+.format-toggle {
+  display: flex;
+  gap: 4px;
+}
+
+.fmt-btn {
+  background: #1a1a2e;
+  border: 1px solid #333;
+  color: #666;
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.fmt-btn.active {
+  border-color: #a078dc;
+  color: #a078dc;
+}
+
+/* Opacity slider */
+.opacity-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.opacity-control span {
+  font-size: 10px;
+  color: #888;
+  width: 30px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+#s-opacity {
+  -webkit-appearance: none;
+  width: 90px;
+  height: 3px;
+  border-radius: 2px;
+  background: #333;
+  outline: none;
+  cursor: pointer;
+}
+
+#s-opacity::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #a078dc;
+  cursor: pointer;
+}
+
+/* ── Settings-driven visibility ── */
+body.hide-champ-name .champion-name { display: none; }
+body.hide-summoner-name .player-name { display: none; }
+body.hide-own-team .own-team { display: none; }

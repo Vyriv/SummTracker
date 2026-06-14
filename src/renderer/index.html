@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>SummTracker</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="titlebar">
+      <button id="collapse-btn" title="Hide overlay">
+        <span></span>
+        <span></span>
+        <span></span>
+      </button>
+      <span id="titlebar-label">SummTracker</span>
+      <button id="settings-btn" title="Settings">⚙</button>
+      <button id="close-btn" title="Quit">✕</button>
+    </div>
+
+    <div id="content">
+      <div id="settings-panel" class="screen hidden">
+        <div class="setting-row">
+          <span class="setting-label">Show own team</span>
+          <label class="toggle"><input type="checkbox" id="s-own-team" checked><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
+          <span class="setting-label">Champion name</span>
+          <label class="toggle"><input type="checkbox" id="s-champ-name" checked><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
+          <span class="setting-label">Summoner name</span>
+          <label class="toggle"><input type="checkbox" id="s-summoner-name" checked><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
+          <span class="setting-label">Timer format</span>
+          <div class="format-toggle">
+            <button class="fmt-btn active" data-fmt="mm:ss">m:ss</button>
+            <button class="fmt-btn" data-fmt="s">sec</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <span class="setting-label">Opacity</span>
+          <div class="opacity-control">
+            <input type="range" id="s-opacity" min="30" max="100" step="5" value="90" />
+            <span id="s-opacity-value">90%</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="idle-screen" class="screen">
+        <div class="waiting">Waiting for game...</div>
+      </div>
+
+      <div id="game-screen" class="screen hidden">
+        <div class="team-block" id="team-order"></div>
+        <div class="divider"></div>
+        <div class="team-block" id="team-chaos"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
