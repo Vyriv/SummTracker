@@ -17,11 +17,11 @@ A lightweight Windows overlay for League of Legends that tracks summoner spell a
 
 Download and run **SummTracker Setup.exe** from the [latest release](https://github.com/Vyriv/SummTracker/releases/latest).
 
-No configuration needed. The overlay starts tracking as soon as you enter champion select or load into a game.
+No configuration needed. The overlay starts tracking as soon as you load into a game.
 
 ## How it works
 
-SummTracker polls the [League Live Game Data API](https://developer.riotgames.com/docs/lol#game-client-api) that runs locally on your machine during a game. No Riot API key is required — everything is read from the local client.
+SummTracker polls the [League Live Game Data API](https://developer.riotgames.com/docs/lol#game-client-api) that runs locally on your machine during a game. No Riot API key is required, everything is read from the local client.
 
 Cooldown values are sourced from DDragon on first launch and cached until the next patch.
 
