@@ -1,4 +1,4 @@
-# ![SummTracker icon](assets/tray-icon.png) SummTracker
+# SummTracker
 
 A lightweight Windows overlay for League of Legends that tracks summoner spell and ultimate cooldowns for all 10 players in real time.
 
