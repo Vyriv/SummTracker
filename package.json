@@ -1,6 +1,6 @@
 {
   "name": "summtracker",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "League of Legends summoner spell & ultimate tracker overlay",
   "main": "src/main/index.js",
   "scripts": {

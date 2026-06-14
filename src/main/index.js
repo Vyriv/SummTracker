@@ -93,6 +93,14 @@ function createWindow() {
 }
 
 ipcMain.on('quit-app', () => app.quit());
+let settingsOpen = false;
+ipcMain.on('set-focusable', (_, focusable) => {
+  settingsOpen = focusable;
+  if (win && !win.isDestroyed()) {
+    win.setFocusable(focusable);
+    if (focusable) win.focus();
+  }
+});
 ipcMain.on('tray-quit', () => app.quit());
 ipcMain.on('tray-toggle-autolaunch', () => applyAutoLaunch(!autoLaunch));
 
@@ -249,6 +257,7 @@ async function pollGameState() {
       win.hide();
       stopLevelPolling();
       stopWindowLock();
+
       return;
     }
 
@@ -260,6 +269,7 @@ async function pollGameState() {
       win.hide();
       stopLevelPolling();
       stopWindowLock();
+
       return;
     }
 
@@ -279,6 +289,7 @@ async function pollGameState() {
           win.hide();
           stopLevelPolling();
           stopWindowLock();
+    
         }
       } catch {
         if (gameState !== 'idle') {
@@ -287,6 +298,7 @@ async function pollGameState() {
           win.hide();
           stopLevelPolling();
           stopWindowLock();
+    
         }
       }
     }
@@ -357,10 +369,11 @@ function startWindowLock() {
 
   windowLockInterval = setInterval(async () => {
     if (!win || win.isDestroyed() || gameState !== 'in-game') return;
+    if (settingsOpen) return;
 
     const foreground = await getForegroundWindowInfo();
     if (isLeagueGameWindow(foreground)) {
-      if (!win.isVisible()) win.show();
+      if (!win.isVisible()) win.showInactive();
       return;
     }
 
@@ -627,7 +640,7 @@ function openTrayMenu() {
   trayMenu.on('closed', () => { trayMenu = null; });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   initCooldowns(app.getPath('userData'));
   createWindow();
 

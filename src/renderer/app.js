@@ -6,6 +6,7 @@ const DEFAULT_SETTINGS = {
   showSummonerName: true,
   format: 'mm:ss',
   opacity: 90,
+  collapseBind: null,
 };
 
 let settings = { ...DEFAULT_SETTINGS };
@@ -31,11 +32,36 @@ function applySettings() {
   });
 
   const opacity = settings.opacity ?? 90;
-  document.getElementById('app').style.opacity = opacity / 100;
+  const app = document.getElementById('app');
+  // Apply opacity only to background, keep text fully opaque
+  const bgAlpha = (opacity / 100).toFixed(2);
+  app.style.setProperty('--bg-opacity', bgAlpha);
+  // As background fades, add text shadow for readability
+  const shadowStrength = Math.max(0, 1 - opacity / 60);
+  const shadow = shadowStrength > 0
+    ? `0 1px ${Math.round(shadowStrength * 6)}px #000, 0 0 ${Math.round(shadowStrength * 10)}px #000`
+    : 'none';
+  document.body.style.setProperty('--text-shadow', shadow);
+
   const opacitySlider = document.getElementById('s-opacity');
   if (opacitySlider) {
     opacitySlider.value = opacity;
     document.getElementById('s-opacity-value').textContent = `${opacity}%`;
+  }
+
+  const bindBtn = document.getElementById('s-collapse-bind');
+  if (bindBtn && !bindBtn.classList.contains('listening')) {
+    const b = settings.collapseBind;
+    if (!b) {
+      bindBtn.textContent = 'None';
+    } else {
+      const parts = [];
+      if (b.ctrl)  parts.push('Ctrl');
+      if (b.alt)   parts.push('Alt');
+      if (b.shift) parts.push('Shift');
+      parts.push(b.key.toUpperCase());
+      bindBtn.textContent = parts.join('+');
+    }
   }
 }
 
@@ -72,6 +98,45 @@ function initSettingsPanel() {
     saveSettings();
     applySettings();
   });
+
+
+  const bindBtn = document.getElementById('s-collapse-bind');
+  let listeningForBind = false;
+
+  bindBtn.addEventListener('click', () => {
+    if (listeningForBind) return;
+    listeningForBind = true;
+    bindBtn.textContent = '…';
+    bindBtn.classList.add('listening');
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (listeningForBind) {
+      e.preventDefault();
+      if (e.key === 'Escape') {
+        settings.collapseBind = null;
+      } else {
+        settings.collapseBind = {
+          key: e.key.toLowerCase(),
+          shift: e.shiftKey,
+          ctrl: e.ctrlKey,
+          alt: e.altKey,
+        };
+      }
+      listeningForBind = false;
+      bindBtn.classList.remove('listening');
+      saveSettings();
+      applySettings();
+      return;
+    }
+
+    if (settings.collapseBind && e.key.toLowerCase() === settings.collapseBind.key &&
+        e.shiftKey === settings.collapseBind.shift &&
+        e.ctrlKey === settings.collapseBind.ctrl &&
+        e.altKey === settings.collapseBind.alt) {
+      document.getElementById('collapse-btn').click();
+    }
+  }, true);
 }
 
 let settingsOpen = false;
@@ -83,7 +148,8 @@ function toggleSettings() {
   document.getElementById('game-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'game-screen');
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'idle-screen');
 
-  // Resize to fit game content when closing settings (game screen now visible and measurable)
+  window.overlay.setFocusable(settingsOpen);
+
   if (!settingsOpen && currentScreen === 'game-screen') {
     syncGameHeight();
   }
@@ -544,3 +610,4 @@ window.overlay.onSyncCooldownSnapshot((events) => {
   pendingSyncEvents = [];
   events.forEach(event => queueOrApplySyncEvent(event));
 });
+

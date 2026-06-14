@@ -9,6 +9,7 @@ body {
   background: transparent;
   font-family: 'Segoe UI', sans-serif;
   color: #e8d5a3;
+  text-shadow: var(--text-shadow, none);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   width: 100vw;
@@ -16,8 +17,8 @@ body {
 }
 
 #app {
-  background: rgba(5, 8, 15, 0.82);
-  border: 1px solid rgba(200, 170, 90, 0.3);
+  background: rgba(5, 8, 15, calc(0.82 * var(--bg-opacity, 1)));
+  border: 1px solid rgba(200, 170, 90, calc(0.3 * var(--bg-opacity, 1)));
   border-radius: 8px;
   backdrop-filter: blur(4px);
   display: flex;
@@ -379,6 +380,22 @@ body.collapsed #content {
   background: #a078dc;
   cursor: pointer;
 }
+
+/* Keybind button */
+.bind-btn {
+  background: #1a1a2e;
+  border: 1px solid #333;
+  color: #ccc;
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  min-width: 60px;
+  text-align: center;
+  transition: all 0.15s;
+}
+.bind-btn:hover { border-color: #555; }
+.bind-btn.listening { border-color: #a078dc; color: #a078dc; }
 
 /* ── Settings-driven visibility ── */
 body.hide-champ-name .champion-name { display: none; }
