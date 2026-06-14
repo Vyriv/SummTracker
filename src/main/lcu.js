@@ -57,6 +57,14 @@ async function getChampSelectSession() {
   }
 }
 
+async function getGameflowSession() {
+  try {
+    return await lcuFetch('/lol-gameflow/v1/session');
+  } catch {
+    return null;
+  }
+}
+
 async function getSummonerByPuuid(puuid) {
   return lcuFetch(`/lol-summoners/v2/summoners/puuid/${puuid}`);
 }
@@ -65,4 +73,4 @@ function isClientRunning() {
   return !!readLockfile();
 }
 
-module.exports = { lcuFetch, getChampSelectSession, isClientRunning };
+module.exports = { lcuFetch, getChampSelectSession, getGameflowSession, isClientRunning };

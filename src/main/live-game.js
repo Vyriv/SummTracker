@@ -17,6 +17,10 @@ async function getAllPlayers() {
   return liveGet('/playerlist');
 }
 
+async function getAllGameData() {
+  return liveGet('/allgamedata');
+}
+
 async function getGameStats() {
   return liveGet('/gamestats');
 }
@@ -34,4 +38,4 @@ async function isGameRunning() {
   }
 }
 
-module.exports = { getAllPlayers, getGameStats, getActivePlayer, isGameRunning };
+module.exports = { getAllPlayers, getAllGameData, getGameStats, getActivePlayer, isGameRunning };

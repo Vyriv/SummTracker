@@ -2,6 +2,7 @@ const fs = require('fs');
 const fetch = require('node-fetch');
 
 const DDRAGON_VERSIONS_URL = 'https://ddragon.leagueoflegends.com/api/versions.json';
+const DEFAULT_ITEM_HASTE = {};
 
 // Base cooldowns in seconds
 const SUMMONER_SPELLS = {
@@ -202,6 +203,8 @@ const ULT_COOLDOWNS = {
   Zyra:            [110, 100, 90],
 };
 
+let ITEM_HASTE = { ...DEFAULT_ITEM_HASTE };
+
 function getUltCooldown(championName, level = 1) {
   const cds = ULT_COOLDOWNS[championName];
   if (!cds) return 120;
@@ -226,8 +229,71 @@ function getSummonerSpell(spellId) {
   return SUMMONER_SPELLS[spellId] || { name: spellId, cd: 300, icon: spellId };
 }
 
+function stripHtml(text) {
+  return String(text || '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractItemHaste(item) {
+  const description = stripHtml(item?.description);
+  const abilityHasteMatches = [...description.matchAll(/(\d+(?:\.\d+)?)\s+Ability Haste\b/gi)];
+  const ultimateHasteMatches = [...description.matchAll(/(\d+(?:\.\d+)?)\s+Ultimate Ability Haste\b/gi)];
+  const summonerHasteMatches = [...description.matchAll(/(\d+(?:\.\d+)?)\s+Summoner Spell Haste\b/gi)];
+
+  const sumMatches = matches => matches.reduce((total, match) => total + Number(match[1] || 0), 0);
+
+  return {
+    abilityHaste: sumMatches(abilityHasteMatches) - sumMatches(ultimateHasteMatches) - sumMatches(summonerHasteMatches),
+    ultimateHaste: sumMatches(ultimateHasteMatches),
+    summonerSpellHaste: sumMatches(summonerHasteMatches),
+  };
+}
+
+function getItemHasteTotals(items = []) {
+  return items.reduce((totals, item) => {
+    const haste = ITEM_HASTE[item.itemID];
+    if (!haste) return totals;
+
+    totals.abilityHaste += haste.abilityHaste || 0;
+    totals.ultimateHaste += haste.ultimateHaste || 0;
+    totals.summonerSpellHaste += haste.summonerSpellHaste || 0;
+    return totals;
+  }, { abilityHaste: 0, ultimateHaste: 0, summonerSpellHaste: 0 });
+}
+
+function applyHasteToCooldown(baseCd, haste = 0) {
+  if (!Number.isFinite(baseCd) || baseCd <= 0) return baseCd;
+  if (!Number.isFinite(haste) || haste <= 0) return baseCd;
+  return Math.round((baseCd * 100 / (100 + haste)) * 10) / 10;
+}
+
+function applyUltItemHaste(ultCooldowns, items = []) {
+  const { abilityHaste, ultimateHaste } = getItemHasteTotals(items);
+  const totalHaste = abilityHaste + ultimateHaste;
+  if (totalHaste <= 0) return ultCooldowns;
+  return ultCooldowns.map(cd => applyHasteToCooldown(cd, totalHaste));
+}
+
+function applySummonerSpellHaste(spell, items = [], mode = 'unknown') {
+  if (!spell) return spell;
+
+  const { summonerSpellHaste } = getItemHasteTotals(items);
+  const modeHaste = mode === 'aram' ? 70 : 0;
+  const totalHaste = summonerSpellHaste + modeHaste;
+  if (totalHaste <= 0) return spell;
+
+  return {
+    ...spell,
+    cd: applyHasteToCooldown(spell.cd, totalHaste),
+  };
+}
+
 async function initCooldowns(userDataPath) {
   const cachePath = `${userDataPath}/ult-cache.json`;
+  const itemCachePath = `${userDataPath}/item-haste-cache.json`;
   try {
     const versionsRes = await fetch(DDRAGON_VERSIONS_URL, { timeout: 5000 });
     const versions = await versionsRes.json();
@@ -238,25 +304,62 @@ async function initCooldowns(userDataPath) {
 
     if (cached?.version === latest) {
       Object.assign(ULT_COOLDOWNS, cached.cooldowns);
+    }
+    if (cached?.version !== latest) {
+      const dataRes = await fetch(
+        `https://ddragon.leagueoflegends.com/cdn/${latest}/data/en_US/championFull.json`,
+        { timeout: 30000 }
+      );
+      const data = await dataRes.json();
+
+      const cooldowns = {};
+      for (const [key, champ] of Object.entries(data.data)) {
+        const cds = champ.spells[3].cooldown.slice(0, 3);
+        while (cds.length < 3) cds.push(cds[cds.length - 1]);
+        cooldowns[key] = cds;
+      }
+
+      Object.assign(ULT_COOLDOWNS, cooldowns);
+      fs.writeFileSync(cachePath, JSON.stringify({ version: latest, cooldowns }));
+    }
+
+    let itemCached = null;
+    try { itemCached = JSON.parse(fs.readFileSync(itemCachePath, 'utf8')); } catch {}
+
+    if (itemCached?.version === latest) {
+      ITEM_HASTE = itemCached.itemHaste || {};
       return;
     }
 
-    const dataRes = await fetch(
-      `https://ddragon.leagueoflegends.com/cdn/${latest}/data/en_US/championFull.json`,
+    const itemRes = await fetch(
+      `https://ddragon.leagueoflegends.com/cdn/${latest}/data/en_US/item.json`,
       { timeout: 30000 }
     );
-    const data = await dataRes.json();
+    const itemData = await itemRes.json();
+    const itemHaste = {};
 
-    const cooldowns = {};
-    for (const [key, champ] of Object.entries(data.data)) {
-      const cds = champ.spells[3].cooldown.slice(0, 3);
-      while (cds.length < 3) cds.push(cds[cds.length - 1]);
-      cooldowns[key] = cds;
+    for (const [itemId, item] of Object.entries(itemData.data || {})) {
+      const haste = extractItemHaste(item);
+      if (haste.abilityHaste || haste.ultimateHaste || haste.summonerSpellHaste) {
+        itemHaste[Number(itemId)] = haste;
+      }
     }
 
-    Object.assign(ULT_COOLDOWNS, cooldowns);
-    fs.writeFileSync(cachePath, JSON.stringify({ version: latest, cooldowns }));
+    ITEM_HASTE = itemHaste;
+    fs.writeFileSync(itemCachePath, JSON.stringify({ version: latest, itemHaste }));
   } catch {}
 }
 
-module.exports = { getSummonerSpell, getUltCooldown, getUltCooldowns, getUltLevelFromChampLevel, initCooldowns, SUMMONER_SPELLS, ULT_COOLDOWNS };
+module.exports = {
+  getSummonerSpell,
+  getUltCooldown,
+  getUltCooldowns,
+  getUltLevelFromChampLevel,
+  getItemHasteTotals,
+  applyHasteToCooldown,
+  applyUltItemHaste,
+  applySummonerSpellHaste,
+  initCooldowns,
+  SUMMONER_SPELLS,
+  ULT_COOLDOWNS,
+};

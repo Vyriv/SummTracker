@@ -3,9 +3,9 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
-const { isClientRunning, getChampSelectSession } = require('./lcu');
-const { getAllPlayers, isGameRunning, getActivePlayer } = require('./live-game');
-const { getSummonerSpell, getUltCooldowns, getUltLevelFromChampLevel, initCooldowns } = require('./cooldowns');
+const { isClientRunning, getChampSelectSession, getGameflowSession } = require('./lcu');
+const { getAllPlayers, getAllGameData, isGameRunning, getActivePlayer } = require('./live-game');
+const { getSummonerSpell, getUltCooldowns, getUltLevelFromChampLevel, applyUltItemHaste, applySummonerSpellHaste, initCooldowns } = require('./cooldowns');
 
 const COLLAPSED_HEIGHT = 32;
 const NATURAL_WIDTH = 320;
@@ -24,6 +24,9 @@ let isCollapsed = false;
 let expandedBounds = loadBounds();
 let syncRoomId = null;
 let syncChannel = null;
+
+const ARAM_QUEUE_IDS = new Set([450]);
+const DRAFT_QUEUE_IDS = new Set([400, 420, 430, 440]);
 
 function loadBounds() {
   try {
@@ -178,19 +181,37 @@ async function pollGameState() {
 
   if (gameRunning && gameState !== 'in-game') {
     try {
-      const players = await getAllPlayers();
-      const mapped = players.map(p => ({
+      const [players, gameflowSession, liveGameData] = await Promise.all([
+        getAllPlayers(),
+        getGameflowSession(),
+        getAllGameData().catch(() => null),
+      ]);
+      const mode = detectGameMode({ gameflowSession, liveGameData });
+      const mapped = players.map(p => {
+        const ultCds = applyUltItemHaste(getUltCooldowns(p.championName), p.items);
+        const spell1 = applySummonerSpellHaste(
+          getSummonerSpell(spellIdFromRaw(p.summonerSpells?.summonerSpellOne)),
+          p.items,
+          mode
+        );
+        const spell2 = applySummonerSpellHaste(
+          getSummonerSpell(spellIdFromRaw(p.summonerSpells?.summonerSpellTwo)),
+          p.items,
+          mode
+        );
+        return {
         summonerName: p.summonerName,
         riotIdGameName: p.riotIdGameName || '',
         championName: p.championName,
         ddKey: ddKeyFromRaw(p.rawChampionName, p.championName),
         team: p.team,
-        spell1: getSummonerSpell(spellIdFromRaw(p.summonerSpells?.summonerSpellOne)),
-        spell2: getSummonerSpell(spellIdFromRaw(p.summonerSpells?.summonerSpellTwo)),
-        ultCds: getUltCooldowns(p.championName),
+        spell1,
+        spell2,
+        ultCds,
         champLevel: p.level ?? 1,
         ultLevel: getUltLevelFromChampLevel(p.level ?? 1),
-      }));
+        };
+      });
 
 
       let ownTeam = null;
@@ -209,7 +230,7 @@ async function pollGameState() {
 
       gameState = 'in-game';
       win.show();
-      win.webContents.send('game-data', { state: 'in-game', players: mapped, ownTeam });
+      win.webContents.send('game-data', { state: 'in-game', players: mapped, ownTeam, mode });
       await syncToMatchRoom(mapped, ownTeam);
       startLevelPolling(mapped);
     } catch (e) {
@@ -241,7 +262,11 @@ async function pollGameState() {
         const session = await getChampSelectSession();
         if (session && gameState !== 'champ-select') {
           gameState = 'champ-select';
-          win.webContents.send('game-data', { state: 'champ-select', session });
+          win.webContents.send('game-data', {
+            state: 'champ-select',
+            session,
+            mode: detectGameMode({ champSelectSession: session }),
+          });
         } else if (!session && gameState === 'champ-select') {
           gameState = 'idle';
           await syncToMatchRoom(null, null);
@@ -294,6 +319,105 @@ function ddKeyFromRaw(rawChampionName, fallback) {
   const match = rawChampionName?.match(/game_character_displayname_(.+)/);
   if (match) return match[1];
   return (fallback || '').replace(/[' .]/g, '');
+}
+
+function firstNumeric(...values) {
+  for (const value of values) {
+    const num = Number(value);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+  return null;
+}
+
+function normalizeQueueId(session) {
+  if (!session) return null;
+
+  return firstNumeric(
+    session.queueId,
+    session.gameData?.queue?.id,
+    session.gameData?.queue?.queueId,
+    session.gameData?.queue?.gameQueueConfigId,
+    session.gameData?.queue?.queueTypeId,
+    session.map?.gameQueueConfigId
+  );
+}
+
+function normalizeModeText(...values) {
+  return values
+    .filter(value => typeof value === 'string' && value.trim())
+    .join(' ')
+    .toLowerCase();
+}
+
+function classifyModeFromQueueId(queueId) {
+  if (queueId == null) return null;
+  if (ARAM_QUEUE_IDS.has(queueId)) return 'aram';
+  if (queueId >= 1700 && queueId < 1800) return 'arena';
+  if (DRAFT_QUEUE_IDS.has(queueId)) return 'draft';
+  return null;
+}
+
+function classifyModeFromText(text) {
+  if (!text) return null;
+  if (text.includes('aram') || text.includes('howling abyss')) return 'aram';
+  if (text.includes('arena') || text.includes('cherry')) return 'arena';
+  if (text.includes('swiftplay') || text.includes('swift play')) return 'swift';
+  if (
+    text.includes('draft') ||
+    text.includes('ranked') ||
+    text.includes('summoner\'s rift') ||
+    text.includes('summoners rift')
+  ) {
+    return 'draft';
+  }
+  return null;
+}
+
+function detectGameMode({ champSelectSession = null, gameflowSession = null, liveGameData = null } = {}) {
+  const session = gameflowSession || champSelectSession;
+  const queueId = normalizeQueueId(session);
+  const fromQueueId = classifyModeFromQueueId(queueId);
+  if (fromQueueId) return fromQueueId;
+
+  const sessionText = normalizeModeText(
+    session?.phase,
+    session?.gameData?.queue?.name,
+    session?.gameData?.queue?.shortName,
+    session?.gameData?.queue?.description,
+    session?.gameData?.queue?.detailedDescription,
+    session?.gameData?.queue?.type,
+    session?.gameData?.queue?.map?.name,
+    session?.map?.name
+  );
+  const fromSessionText = classifyModeFromText(sessionText);
+  if (fromSessionText) return fromSessionText;
+
+  const liveQueueId = firstNumeric(
+    liveGameData?.gameData?.queueId,
+    liveGameData?.gameData?.gameQueueConfigId,
+    liveGameData?.queueId
+  );
+  const fromLiveQueueId = classifyModeFromQueueId(liveQueueId);
+  if (fromLiveQueueId) return fromLiveQueueId;
+
+  const liveText = normalizeModeText(
+    liveGameData?.gameData?.gameMode,
+    liveGameData?.gameData?.gameType,
+    liveGameData?.gameData?.mapName,
+    liveGameData?.gameData?.mapTerrain,
+    liveGameData?.mapName
+  );
+  const fromLiveText = classifyModeFromText(liveText);
+  if (fromLiveText) return fromLiveText;
+
+  const mapId = firstNumeric(
+    liveGameData?.gameData?.mapNumber,
+    liveGameData?.gameData?.mapId,
+    liveGameData?.gameMap
+  );
+  if (mapId === 12) return 'aram';
+
+  return 'unknown';
 }
 
 function normalizePlayerId(player) {
