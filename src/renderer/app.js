@@ -173,6 +173,11 @@ function cancelCooldown(playerIndex, type) {
   }
 }
 
+function resetAllCooldowns() {
+  Object.values(timers).forEach(({ interval }) => clearInterval(interval));
+  Object.keys(timers).forEach(key => delete timers[key]);
+}
+
 function spellIconUrl(spellId) {
   return `${DDragon}/img/spell/${spellId}.png`;
 }
@@ -349,6 +354,8 @@ function buildSpellButton(playerIndex, type, spell, baseCd) {
 }
 
 function renderPlayers(players) {
+  resetAllCooldowns();
+
   const allyTeamId  = ownTeam || 'ORDER';
   const enemyTeamId = allyTeamId === 'ORDER' ? 'CHAOS' : 'ORDER';
 
@@ -418,6 +425,7 @@ window.overlay.onGameData((data) => {
     showScreen('game-screen');
     syncGameHeight();
   } else {
+    resetAllCooldowns();
     showScreen('idle-screen');
   }
 });
