@@ -8,9 +8,9 @@ A lightweight Windows overlay for League of Legends that tracks summoner spell a
 
 - Automatically appears when a game starts, hides when it ends
 - Shows summoner spells and ultimate for every player, split by ally / enemy team
-- Click any spell to start its cooldown timer — click again to reset
+- Click any spell to start its cooldown timer, click again to reset
 - Ult level pips update automatically as players level up
-- Resizable and repositionable — position saves between sessions
+- Resizable and repositionable, position saves between sessions
 - Cooldown data fetched from DDragon and cached locally, updates automatically each patch
 
 ## Installation
