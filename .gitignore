@@ -2,6 +2,8 @@ node_modules/
 dist/
 out/
 .idea/
+src-tauri/target/
+src-tauri/gen/
 *.log
 .env
 .env.*

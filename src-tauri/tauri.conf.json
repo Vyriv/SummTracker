@@ -1,0 +1,42 @@
+{
+  "productName": "SummTracker",
+  "version": "1.0.3",
+  "identifier": "com.vyriv.summtracker",
+  "build": {
+    "beforeDevCommand": "npm run vite:dev",
+    "beforeBuildCommand": "npm run vite:build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/tray-icon.png"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "SummTracker",
+        "width": 320,
+        "height": 600,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "visible": false,
+        "resizable": true,
+        "minimizable": false,
+        "maximizable": false
+      }
+    ]
+  },
+  "plugins": {}
+}

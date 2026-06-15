@@ -1,6 +1,6 @@
 # SummTracker
 
-A lightweight Windows overlay for League of Legends that tracks summoner spell and ultimate cooldowns for all 10 players in real time.
+A lightweight Tauri desktop overlay for League of Legends that tracks summoner spell and ultimate cooldowns for all 10 players in real time.
 
 ![SummTracker overlay](assets/preview.png)
 
@@ -15,7 +15,7 @@ A lightweight Windows overlay for League of Legends that tracks summoner spell a
 
 ## Installation
 
-Download and run **SummTracker Setup.exe** from the [latest release](https://github.com/Vyriv/SummTracker/releases/latest).
+Download and run the installer from the [latest release](https://github.com/Vyriv/SummTracker/releases/latest).
 
 No configuration needed. The overlay starts tracking as soon as you load into a game.
 
@@ -32,8 +32,10 @@ Cooldown values are sourced from DDragon on first launch and cached until the ne
 
 ## Building from source
 
+This project uses a Tauri backend with a Vite-rendered frontend.
+
 ```bash
 npm install
-npm start        # run in dev
-npm run dist     # build installer
+npm run dev      # run in dev
+npm run build    # build Windows installer
 ```

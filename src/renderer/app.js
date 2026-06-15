@@ -1,3 +1,15 @@
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { createClient } from '@supabase/supabase-js';
+import {
+  getSummonerSpell,
+  getUltCooldowns,
+  getUltLevelFromChampLevel,
+  applyUltItemHaste,
+  applySummonerSpellHaste,
+  initItemHaste,
+} from './cooldowns.js';
+
 // ── Settings ──
 
 const DEFAULT_SETTINGS = {
@@ -16,7 +28,7 @@ let enemyPlayerIndices = [];
 let pendingSyncEvents = [];
 
 function saveSettings() {
-  window.overlay.saveSettings(settings);
+  invoke('save_settings', { settings });
 }
 
 function applySettings() {
@@ -33,10 +45,8 @@ function applySettings() {
 
   const opacity = settings.opacity ?? 90;
   const app = document.getElementById('app');
-  // Apply opacity only to background, keep text fully opaque
   const bgAlpha = (opacity / 100).toFixed(2);
   app.style.setProperty('--bg-opacity', bgAlpha);
-  // As background fades, add text shadow for readability
   const shadowStrength = Math.max(0, 1 - opacity / 60);
   const shadow = shadowStrength > 0
     ? `0 1px ${Math.round(shadowStrength * 6)}px #000, 0 0 ${Math.round(shadowStrength * 10)}px #000`
@@ -70,7 +80,6 @@ function initSettingsPanel() {
     settings.showOwnTeam = e.target.checked;
     saveSettings();
     applySettings();
-    // Height sync happens when settings closes — game screen must be visible to measure
   });
 
   document.getElementById('s-champ-name').addEventListener('change', e => {
@@ -99,7 +108,6 @@ function initSettingsPanel() {
     applySettings();
   });
 
-
   const bindBtn = document.getElementById('s-collapse-bind');
   let listeningForBind = false;
 
@@ -113,11 +121,16 @@ function initSettingsPanel() {
   window.addEventListener('keydown', (e) => {
     if (listeningForBind) {
       e.preventDefault();
+      const key = e.key.toLowerCase();
+      const isModifierOnly = key === 'shift' || key === 'control' || key === 'ctrl' || key === 'alt' || key === 'meta';
+      if (isModifierOnly) {
+        return;
+      }
       if (e.key === 'Escape') {
         settings.collapseBind = null;
       } else {
         settings.collapseBind = {
-          key: e.key.toLowerCase(),
+          key,
           shift: e.shiftKey,
           ctrl: e.ctrlKey,
           alt: e.altKey,
@@ -127,10 +140,18 @@ function initSettingsPanel() {
       bindBtn.classList.remove('listening');
       saveSettings();
       applySettings();
-      window.overlay.updateCollapseBind(settings.collapseBind);
+      invoke('update_collapse_bind', { bind: settings.collapseBind });
       return;
     }
   }, true);
+}
+
+function isBindMatch(event, bind) {
+  if (!bind || !bind.key) return false;
+  return event.key.toLowerCase() === bind.key.toLowerCase()
+    && Boolean(event.shiftKey) === Boolean(bind.shift)
+    && Boolean(event.ctrlKey) === Boolean(bind.ctrl)
+    && Boolean(event.altKey) === Boolean(bind.alt);
 }
 
 let settingsOpen = false;
@@ -142,44 +163,114 @@ function toggleSettings() {
   document.getElementById('game-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'game-screen');
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'idle-screen');
 
-  window.overlay.setFocusable(settingsOpen);
-
-  if (!settingsOpen && currentScreen === 'game-screen') {
-    syncGameHeight();
-  }
+  invoke('set_focusable', { focusable: settingsOpen });
+  syncGameHeight();
 }
 
 let currentScreen = 'idle-screen';
 
 // ── Scaling ──
 
-const NATURAL_WIDTH = 320;
-
 function updateScale() {
-  const scale = window.innerWidth / NATURAL_WIDTH;
+  const scale = document.body.clientWidth / 320;
   document.getElementById('app').style.transform = `scale(${scale})`;
 }
 
-// Measure the game screen height and tell main process to resize window to fit.
-// Must be called while the game screen is visible (not while settings is open).
 function syncGameHeight() {
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const app = document.getElementById('app');
     const h = app.scrollHeight;
-    if (h > 0) window.overlay.sendNaturalHeight(h);
+    if (h > 0) invoke('set_natural_height', { height: h });
   }));
 }
 
 new ResizeObserver(updateScale).observe(document.body);
 
-let DDragon = 'https://ddragon.leagueoflegends.com/cdn/14.24.1'; // fallback
+let DDragon = 'https://ddragon.leagueoflegends.com/cdn/14.24.1';
 
 fetch('https://ddragon.leagueoflegends.com/api/versions.json')
   .then(r => r.json())
   .then(versions => { DDragon = `https://ddragon.leagueoflegends.com/cdn/${versions[0]}`; })
   .catch(() => {});
 
-// Active cooldown timers: { [key]: { endsAt, interval } }
+// ── Supabase room sync ──
+
+const SUPABASE_URL = 'https://sjodltcylcxvauvgabot.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_ex94Isy1_u-qzXJWJEqeQg_9nhGkohm';
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+let syncRoomId = null;
+let syncChannel = null;
+
+async function syncToRoom(roomId) {
+  if (roomId === syncRoomId) return;
+
+  if (syncChannel) {
+    await supabase.removeChannel(syncChannel);
+    syncChannel = null;
+  }
+
+  syncRoomId = roomId;
+
+  if (!syncRoomId) return;
+
+  const { data } = await supabase
+    .from('cooldowns')
+    .select('enemy_index, spell, started_at, duration_ms')
+    .eq('room_id', syncRoomId)
+    .gt('duration_ms', 0);
+
+  if (data) {
+    data.forEach(row => queueOrApplySyncEvent({
+      action: 'start',
+      enemyIndex: row.enemy_index,
+      spell: row.spell,
+      startedAt: row.started_at,
+      durationMs: row.duration_ms,
+    }));
+  }
+
+  syncChannel = supabase
+    .channel(`cooldowns:${syncRoomId}`)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cooldowns', filter: `room_id=eq.${syncRoomId}` },
+      payload => queueOrApplySyncEvent({
+        action: 'start',
+        enemyIndex: payload.new.enemy_index,
+        spell: payload.new.spell,
+        startedAt: payload.new.started_at,
+        durationMs: payload.new.duration_ms,
+      }))
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'cooldowns', filter: `room_id=eq.${syncRoomId}` },
+      payload => queueOrApplySyncEvent({
+        action: payload.new.duration_ms > 0 ? 'start' : 'cancel',
+        enemyIndex: payload.new.enemy_index,
+        spell: payload.new.spell,
+        startedAt: payload.new.started_at,
+        durationMs: payload.new.duration_ms,
+      }))
+    .subscribe();
+}
+
+async function publishSyncEvent(action, enemyIndex, spell, startedAt, durationMs) {
+  if (!syncRoomId) return;
+
+  const match = { room_id: syncRoomId, enemy_index: enemyIndex, spell };
+  const { data: existing } = await supabase
+    .from('cooldowns').select('id').match(match)
+    .order('updated_at', { ascending: false }).limit(1);
+
+  const nextValues = action === 'start'
+    ? { ...match, started_at: startedAt, duration_ms: durationMs, updated_at: new Date().toISOString() }
+    : { started_at: 0, duration_ms: 0, updated_at: new Date().toISOString() };
+
+  if (existing?.length) {
+    await supabase.from('cooldowns').update(nextValues).eq('id', existing[0].id);
+  } else if (action === 'start') {
+    await supabase.from('cooldowns').insert(nextValues);
+  }
+}
+
+// ── Cooldown timers ──
+
 const timers = {};
 
 function cdKey(playerIndex, type) {
@@ -188,9 +279,7 @@ function cdKey(playerIndex, type) {
 
 function startCooldown(playerIndex, type, seconds, startedAt = Date.now()) {
   const key = cdKey(playerIndex, type);
-  if (timers[key]) {
-    clearInterval(timers[key].interval);
-  }
+  if (timers[key]) clearInterval(timers[key].interval);
 
   const endsAt = startedAt + seconds * 1000;
   const btn = document.querySelector(`[data-cd-key="${key}"]`);
@@ -198,7 +287,6 @@ function startCooldown(playerIndex, type, seconds, startedAt = Date.now()) {
 
   btn.classList.add('on-cooldown');
   btn.classList.remove('ready');
-
   const overlay = btn.querySelector('.cooldown-overlay');
 
   function tick() {
@@ -240,6 +328,19 @@ function resetAllCooldowns() {
   Object.keys(timers).forEach(key => delete timers[key]);
 }
 
+// ── Player data enrichment ──
+
+function enrichPlayer(player) {
+  const items = player.items || [];
+  const mode = player.mode || 'unknown';
+  const spell1 = applySummonerSpellHaste(getSummonerSpell(player.spell1Id), items, mode);
+  const spell2 = applySummonerSpellHaste(getSummonerSpell(player.spell2Id), items, mode);
+  const ultCds = applyUltItemHaste(getUltCooldowns(player.championName), items);
+  return { ...player, spell1, spell2, ultCds };
+}
+
+// ── DDragon helpers ──
+
 function spellIconUrl(spellId) {
   return `${DDragon}/img/spell/${spellId}.png`;
 }
@@ -248,7 +349,6 @@ function champIconUrl(ddKey) {
   return `${DDragon}/img/champion/${ddKey}.png`;
 }
 
-// Cache of ddKey → ult spell icon filename (fetched from DDragon champion data)
 const ultIconCache = {};
 
 function setUltIcon(img, ddKey) {
@@ -264,24 +364,22 @@ function setUltIcon(img, ddKey) {
       ultIconCache[ddKey] = ultId;
       img.src = `${DDragon}/img/spell/${ultId}.png`;
     })
-    .catch(() => {
-      img.src = champIconUrl(ddKey);
-    });
+    .catch(() => { img.src = champIconUrl(ddKey); });
 }
+
+// ── UI builders ──
 
 function buildPlayerRow(player, index, enemyIndex = null) {
   const row = document.createElement('div');
   row.className = 'player-row';
   row.dataset.playerIndex = index;
 
-  // Champion icon
   const champImg = document.createElement('img');
   champImg.className = 'champion-icon';
   champImg.src = champIconUrl(player.ddKey);
   champImg.alt = player.championName;
   champImg.onerror = () => { champImg.style.background = '#222'; };
 
-  // Player info
   const info = document.createElement('div');
   info.className = 'player-info';
   const nameEl = document.createElement('div');
@@ -293,16 +391,12 @@ function buildPlayerRow(player, index, enemyIndex = null) {
   info.appendChild(nameEl);
   info.appendChild(champEl);
 
-  // Spells container
   const spells = document.createElement('div');
   spells.className = 'spells';
 
-  // Summoner spell 1
   spells.appendChild(buildSpellButton(index, 'spell1', player.spell1, player.spell1.cd, enemyIndex));
-  // Summoner spell 2
   spells.appendChild(buildSpellButton(index, 'spell2', player.spell2, player.spell2.cd, enemyIndex));
 
-  // Ult button + level pips
   const ultGroup = document.createElement('div');
   ultGroup.style.display = 'flex';
   ultGroup.style.alignItems = 'center';
@@ -327,29 +421,6 @@ function buildPlayerRow(player, index, enemyIndex = null) {
 
   let ultLevel = player.ultLevel || 0;
 
-  ultBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const key = cdKey(index, 'ult');
-    if (timers[key]) {
-      cancelCooldown(index, 'ult');
-      if (enemyIndex != null) {
-        window.overlay.sendSyncCooldownEvent({ action: 'cancel', enemyIndex, spell: 'ult' });
-      }
-    } else {
-      const cd = Number(ultBtn.dataset.baseCd) || 120;
-      startCooldown(index, 'ult', cd);
-      if (enemyIndex != null) {
-        window.overlay.sendSyncCooldownEvent({
-          action: 'start',
-          enemyIndex,
-          spell: 'ult',
-          startedAt: Date.now(),
-          durationMs: Math.round(cd * 1000),
-        });
-      }
-    }
-  });
-
   function applyUltLevel(lvl) {
     ultLevel = lvl;
     pips.querySelectorAll('.ult-pip').forEach(p => {
@@ -359,7 +430,23 @@ function buildPlayerRow(player, index, enemyIndex = null) {
     ultBtn.dataset.baseCd = cds[Math.max(0, ultLevel - 1)] || cds[0];
   }
 
-  // Ult level pips
+  ultBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const key = cdKey(index, 'ult');
+    if (timers[key]) {
+      cancelCooldown(index, 'ult');
+      if (enemyIndex != null) {
+        publishSyncEvent('cancel', enemyIndex, 'ult');
+      }
+    } else {
+      const cd = Number(ultBtn.dataset.baseCd) || 120;
+      startCooldown(index, 'ult', cd);
+      if (enemyIndex != null) {
+        publishSyncEvent('start', enemyIndex, 'ult', Date.now(), Math.round(cd * 1000));
+      }
+    }
+  });
+
   const pips = document.createElement('div');
   pips.className = 'ult-level';
   pips.dataset.playerIndex = index;
@@ -370,7 +457,6 @@ function buildPlayerRow(player, index, enemyIndex = null) {
     pip.addEventListener('click', (e) => {
       e.stopPropagation();
       applyUltLevel(lvl);
-      window.overlay.sendUltLevelChanged(index, ultLevel);
     });
     pips.appendChild(pip);
   }
@@ -423,18 +509,12 @@ function buildSpellButton(playerIndex, type, spell, baseCd, enemyIndex = null) {
     if (timers[key]) {
       cancelCooldown(playerIndex, type);
       if (enemyIndex != null) {
-        window.overlay.sendSyncCooldownEvent({ action: 'cancel', enemyIndex, spell: type });
+        publishSyncEvent('cancel', enemyIndex, type);
       }
     } else {
       startCooldown(playerIndex, type, baseCd);
       if (enemyIndex != null) {
-        window.overlay.sendSyncCooldownEvent({
-          action: 'start',
-          enemyIndex,
-          spell: type,
-          startedAt: Date.now(),
-          durationMs: Math.round(baseCd * 1000),
-        });
+        publishSyncEvent('start', enemyIndex, type, Date.now(), Math.round(baseCd * 1000));
       }
     }
   });
@@ -455,21 +535,18 @@ function renderPlayers(players) {
   allyEl.innerHTML  = '';
   enemyEl.innerHTML = '';
 
-  // Ally block
-  allyEl.className = `team-block own-team`;
+  allyEl.className = 'team-block own-team';
   const allyLabel = document.createElement('div');
   allyLabel.className = 'team-label ally-label';
   allyLabel.textContent = ownTeam ? 'Ally' : 'Blue Side';
   allyEl.appendChild(allyLabel);
 
-  // Enemy block
   enemyEl.className = 'team-block';
   const enemyLabel = document.createElement('div');
   enemyLabel.className = 'team-label enemy-label';
   enemyLabel.textContent = ownTeam ? 'Enemy' : 'Red Side';
   enemyEl.appendChild(enemyLabel);
 
-  // Put ally team first visually
   const gameScreen = document.getElementById('game-screen');
   const divider = gameScreen.querySelector('.divider');
   gameScreen.insertBefore(allyEl, divider);
@@ -479,7 +556,6 @@ function renderPlayers(players) {
       allyEl.appendChild(buildPlayerRow(player, i));
       return;
     }
-
     const enemyIndex = enemyPlayerIndices.length;
     enemyPlayerIndices.push(i);
     enemyEl.appendChild(buildPlayerRow(player, i, enemyIndex));
@@ -496,100 +572,98 @@ function showScreen(id) {
 
 function applySyncCooldownEvent(event) {
   if (!event || event.enemyIndex == null || !event.spell) return false;
-
   const playerIndex = enemyPlayerIndices[event.enemyIndex];
   if (playerIndex == null) return false;
-
-  if (event.action === 'cancel') {
-    cancelCooldown(playerIndex, event.spell);
-    return true;
-  }
-
+  if (event.action === 'cancel') { cancelCooldown(playerIndex, event.spell); return true; }
   if (event.action === 'start' && event.durationMs != null && event.startedAt != null) {
     startCooldown(playerIndex, event.spell, event.durationMs / 1000, event.startedAt);
     return true;
   }
-
   return false;
 }
 
 function queueOrApplySyncEvent(event) {
-  if (!applySyncCooldownEvent(event)) {
-    pendingSyncEvents.push(event);
-  }
+  if (!applySyncCooldownEvent(event)) pendingSyncEvents.push(event);
 }
 
 function flushPendingSyncEvents() {
   if (pendingSyncEvents.length === 0) return;
-
   pendingSyncEvents = pendingSyncEvents.filter(event => !applySyncCooldownEvent(event));
+}
+
+function handleGameData(data) {
+  if (data.state === 'in-game' && data.players) {
+    ownTeam = data.ownTeam || null;
+    const enriched = data.players.map(enrichPlayer);
+    renderPlayers(enriched);
+    showScreen('game-screen');
+    syncGameHeight();
+    syncToRoom(data.roomId || null);
+  } else {
+    resetAllCooldowns();
+    enemyPlayerIndices = [];
+    pendingSyncEvents = [];
+    syncToRoom(null);
+    showScreen('idle-screen');
+  }
 }
 
 // ── Titlebar controls ──
 
 document.getElementById('collapse-btn').addEventListener('click', () => {
-  window.overlay.sendToggleCollapse();
-});
-
-window.overlay.onSyncCollapse((collapsed) => {
-  document.body.classList.toggle('collapsed', collapsed);
+  invoke('toggle_collapse');
 });
 
 document.getElementById('settings-btn').addEventListener('click', toggleSettings);
 
 document.getElementById('close-btn').addEventListener('click', () => {
-  window.overlay.sendQuit();
+  invoke('quit_app');
 });
 
-window.overlay.loadSettings().then(saved => {
-  settings = { ...DEFAULT_SETTINGS, ...saved };
-  initSettingsPanel();
-  applySettings();
-  window.overlay.updateCollapseBind(settings.collapseBind);
+window.addEventListener('keydown', (event) => {
+  if (settingsOpen) return;
+  if (!isBindMatch(event, settings.collapseBind)) return;
+  event.preventDefault();
+  invoke('toggle_collapse');
+}, true);
+
+// ── Tauri event listeners ──
+
+listen('sync-collapse', (event) => {
+  document.body.classList.toggle('collapsed', event.payload);
 });
 
-// ── IPC listeners ──
-
-window.overlay.onGameData((data) => {
-  if (data.state === 'in-game' && data.players) {
-    ownTeam = data.ownTeam || null;
-    renderPlayers(data.players);
-    showScreen('game-screen');
-    syncGameHeight();
-  } else {
-    resetAllCooldowns();
-    enemyPlayerIndices = [];
-    pendingSyncEvents = [];
-    showScreen('idle-screen');
-  }
+listen('game-data', (event) => {
+  handleGameData(event.payload);
 });
 
-window.overlay.onPlayerLevels((updates) => {
-  updates.forEach(({ playerIndex, ultLevel }) => {
-    // Find the pips container for this player and trigger applyUltLevel via a custom event
+listen('player-levels', (event) => {
+  event.payload.forEach(({ playerIndex, ultLevel }) => {
     const pips = document.querySelector(`.ult-level[data-player-index="${playerIndex}"]`);
-    if (pips) {
-      pips.dispatchEvent(new CustomEvent('auto-level', { detail: { ultLevel } }));
-    }
+    if (pips) pips.dispatchEvent(new CustomEvent('auto-level', { detail: { ultLevel } }));
   });
 });
 
-window.overlay.onPlayerCooldowns((updates) => {
-  updates.forEach(({ playerIndex, spell1Cd, spell2Cd, ultCds }) => {
+listen('player-cooldowns', (event) => {
+  event.payload.forEach(({ playerIndex, spell1Id, spell2Id, championName, items, mode }) => {
+    const spell1 = applySummonerSpellHaste(getSummonerSpell(spell1Id), items, mode);
+    const spell2 = applySummonerSpellHaste(getSummonerSpell(spell2Id), items, mode);
+    const ultCds = applyUltItemHaste(getUltCooldowns(championName), items);
+
     const spell1Btn = document.querySelector(`.spell-btn[data-player-index="${playerIndex}"][data-spell-type="spell1"]`);
     if (spell1Btn) {
-      spell1Btn.dataset.baseCd = spell1Cd;
-      spell1Btn.title = `${spell1Btn.querySelector('img')?.alt || 'Spell'} (${spell1Cd}s)`;
+      spell1Btn.dataset.baseCd = spell1.cd;
+      spell1Btn.title = `${spell1.name} (${spell1.cd}s)`;
     }
 
     const spell2Btn = document.querySelector(`.spell-btn[data-player-index="${playerIndex}"][data-spell-type="spell2"]`);
     if (spell2Btn) {
-      spell2Btn.dataset.baseCd = spell2Cd;
-      spell2Btn.title = `${spell2Btn.querySelector('img')?.alt || 'Spell'} (${spell2Cd}s)`;
+      spell2Btn.dataset.baseCd = spell2.cd;
+      spell2Btn.title = `${spell2.name} (${spell2.cd}s)`;
     }
 
     const ultBtn = document.querySelector(`.ult-btn[data-player-index="${playerIndex}"]`);
-    if (ultBtn && Array.isArray(ultCds)) {
+    if (ultBtn && ultCds.length) {
       ultBtn.dataset.ultCds = JSON.stringify(ultCds);
       const pips = document.querySelector(`.ult-level[data-player-index="${playerIndex}"]`);
       const activePips = pips ? pips.querySelectorAll('.ult-pip.active').length : 0;
@@ -599,13 +673,15 @@ window.overlay.onPlayerCooldowns((updates) => {
   });
 });
 
-window.overlay.onSyncCooldownEvent((event) => {
-  queueOrApplySyncEvent(event);
+// ── Init ──
+
+invoke('load_settings').then(saved => {
+  settings = { ...DEFAULT_SETTINGS, ...saved };
+  initSettingsPanel();
+  applySettings();
+  invoke('update_collapse_bind', { bind: settings.collapseBind });
+  invoke('set_focusable', { focusable: false });
+  invoke('get_latest_game_data').then(handleGameData).catch(() => {});
 });
 
-window.overlay.onSyncCooldownSnapshot((events) => {
-  resetAllCooldowns();
-  pendingSyncEvents = [];
-  events.forEach(event => queueOrApplySyncEvent(event));
-});
-
+initItemHaste();
