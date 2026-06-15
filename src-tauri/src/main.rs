@@ -6,6 +6,7 @@ mod live_game;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State};
@@ -88,6 +89,43 @@ fn data_path(app: &AppHandle, file: &str) -> std::path::PathBuf {
     dir.join(file)
 }
 
+fn legacy_data_paths(app: &AppHandle, file: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(current_dir) = app.path().app_data_dir() else {
+        return paths;
+    };
+    let Some(parent) = current_dir.parent() else {
+        return paths;
+    };
+
+    for legacy_dir in ["summtracker", "com.summtracker.app"] {
+        let candidate = parent.join(legacy_dir).join(file);
+        if candidate != current_dir.join(file) {
+            paths.push(candidate);
+        }
+    }
+
+    paths
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn migrate_file(from: &Path, to: &Path) {
+    if let Some(parent) = to.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if let Err(err) = std::fs::copy(from, to) {
+        debug_log(&format!("failed to migrate {:?} -> {:?}: {}", from, to, err));
+    } else {
+        debug_log(&format!("migrated {:?} -> {:?}", from, to));
+    }
+}
+
 fn load_bounds(app: &AppHandle) -> Bounds {
     let path = data_path(app, BOUNDS_FILE);
     std::fs::read_to_string(&path)
@@ -114,15 +152,32 @@ fn scaled_height_for(width: u32, natural_height: f64) -> u32 {
 #[tauri::command]
 fn load_settings(app: AppHandle) -> Value {
     let path = data_path(&app, SETTINGS_FILE);
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Object(Default::default()))
+    let result = if let Some(settings) = read_json_file(&path) {
+        settings
+    } else {
+        let mut migrated = None;
+        for legacy_path in legacy_data_paths(&app, SETTINGS_FILE) {
+            if let Some(settings) = read_json_file(&legacy_path) {
+                migrated = Some((legacy_path, settings));
+                break;
+            }
+        }
+
+        if let Some((legacy_path, settings)) = migrated {
+            migrate_file(&legacy_path, &path);
+            settings
+        } else {
+            Value::Object(Default::default())
+        }
+    };
+    eprintln!("[settings] load from {:?} => {}", path, result);
+    result
 }
 
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: Value) {
     let path = data_path(&app, SETTINGS_FILE);
+    eprintln!("[settings] save to {:?} => {}", path, settings);
     if let Ok(json) = serde_json::to_string(&settings) {
         let _ = std::fs::write(path, json);
     }
