@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -176,7 +176,7 @@ ipcMain.on('set-natural-height', (event, naturalHeight) => {
   }, 50);
 });
 
-ipcMain.on('toggle-collapse', () => {
+function toggleCollapse() {
   isCollapsed = !isCollapsed;
   if (isCollapsed) {
     expandedBounds = win.getBounds();
@@ -185,7 +185,50 @@ ipcMain.on('toggle-collapse', () => {
   } else {
     win.setSize(expandedBounds.width, expandedBounds.height);
   }
-});
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('sync-collapse', isCollapsed);
+  }
+}
+
+ipcMain.on('toggle-collapse', toggleCollapse);
+
+const KEY_MAP = {
+  ' ': 'Space',
+  'arrowleft': 'Left', 'arrowright': 'Right', 'arrowup': 'Up', 'arrowdown': 'Down',
+  'enter': 'Return',
+};
+
+function bindToAccelerator(bind) {
+  if (!bind) return null;
+  const raw = bind.key.toLowerCase();
+  const key = KEY_MAP[raw] ?? bind.key.toUpperCase();
+  const parts = [];
+  if (bind.ctrl)  parts.push('Control');
+  if (bind.alt)   parts.push('Alt');
+  if (bind.shift) parts.push('Shift');
+  parts.push(key);
+  return parts.join('+');
+}
+
+let currentCollapseAccelerator = null;
+
+function registerCollapseShortcut(bind) {
+  if (currentCollapseAccelerator) {
+    globalShortcut.unregister(currentCollapseAccelerator);
+    currentCollapseAccelerator = null;
+  }
+  if (!bind) return;
+  const accelerator = bindToAccelerator(bind);
+  if (!accelerator) return;
+  try {
+    const ok = globalShortcut.register(accelerator, toggleCollapse);
+    if (ok) currentCollapseAccelerator = accelerator;
+  } catch {}
+}
+
+ipcMain.on('update-collapse-bind', (_, bind) => registerCollapseShortcut(bind));
+
+app.on('will-quit', () => globalShortcut.unregisterAll());
 
 async function pollGameState() {
   const gameRunning = await isGameRunning();

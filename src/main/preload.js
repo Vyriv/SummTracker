@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('overlay', {
     ipcRenderer.send('ult-level-changed', { playerIndex, level }),
   sendSyncCooldownEvent: (payload) => ipcRenderer.send('sync-cooldown-event', payload),
   sendToggleCollapse: () => ipcRenderer.send('toggle-collapse'),
+  updateCollapseBind: (bind) => ipcRenderer.send('update-collapse-bind', bind),
+  onSyncCollapse: (cb) => ipcRenderer.on('sync-collapse', (_, v) => cb(v)),
   setFocusable: (v) => ipcRenderer.send('set-focusable', v),
   sendNaturalHeight: (height) => ipcRenderer.send('set-natural-height', height),
   sendQuit: () => ipcRenderer.send('quit-app'),

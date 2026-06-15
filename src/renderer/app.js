@@ -127,14 +127,8 @@ function initSettingsPanel() {
       bindBtn.classList.remove('listening');
       saveSettings();
       applySettings();
+      window.overlay.updateCollapseBind(settings.collapseBind);
       return;
-    }
-
-    if (settings.collapseBind && e.key.toLowerCase() === settings.collapseBind.key &&
-        e.shiftKey === settings.collapseBind.shift &&
-        e.ctrlKey === settings.collapseBind.ctrl &&
-        e.altKey === settings.collapseBind.alt) {
-      document.getElementById('collapse-btn').click();
     }
   }, true);
 }
@@ -534,8 +528,11 @@ function flushPendingSyncEvents() {
 // ── Titlebar controls ──
 
 document.getElementById('collapse-btn').addEventListener('click', () => {
-  document.body.classList.toggle('collapsed');
   window.overlay.sendToggleCollapse();
+});
+
+window.overlay.onSyncCollapse((collapsed) => {
+  document.body.classList.toggle('collapsed', collapsed);
 });
 
 document.getElementById('settings-btn').addEventListener('click', toggleSettings);
@@ -548,6 +545,7 @@ window.overlay.loadSettings().then(saved => {
   settings = { ...DEFAULT_SETTINGS, ...saved };
   initSettingsPanel();
   applySettings();
+  window.overlay.updateCollapseBind(settings.collapseBind);
 });
 
 // ── IPC listeners ──
