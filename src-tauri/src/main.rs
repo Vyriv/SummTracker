@@ -14,10 +14,30 @@ use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tokio::time::interval;
-use windows::Win32::Foundation::HWND;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    CallWindowProcW, DefWindowProcW, EnumChildWindows,
+    GetWindowLongPtrW, SetWindowLongPtrW,
+    GWL_EXSTYLE, GWLP_WNDPROC, MA_NOACTIVATE, WM_MOUSEACTIVATE, WS_EX_NOACTIVATE,
 };
+
+static ORIG_WND_PROC: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn no_activate_wnd_proc(
+    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_MOUSEACTIVATE {
+        return LRESULT(MA_NOACTIVATE as isize);
+    }
+    let orig = ORIG_WND_PROC.load(Ordering::Relaxed);
+    if orig != 0 {
+        CallWindowProcW(Some(std::mem::transmute(orig)), hwnd, msg, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
 
 const COLLAPSED_HEIGHT: u32 = 32;
 const NATURAL_WIDTH: u32 = 320;
@@ -63,7 +83,9 @@ struct AppState {
 }
 
 fn data_path(app: &AppHandle, file: &str) -> std::path::PathBuf {
-    app.path().app_data_dir().unwrap().join(file)
+    let dir = app.path().app_data_dir().unwrap();
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(file)
 }
 
 fn load_bounds(app: &AppHandle) -> Bounds {
@@ -140,11 +162,28 @@ fn set_focusable(app: AppHandle, state: State<Arc<AppState>>, focusable: bool) {
     *state.settings_open.lock().unwrap() = focusable;
     let win = app.get_webview_window("main").unwrap();
     if let Ok(hwnd) = win.hwnd() {
+        if !focusable && ORIG_WND_PROC.load(Ordering::Relaxed) == 0 {
+            install_no_activate_hook(hwnd);
+        }
         apply_no_activate(hwnd, !focusable);
     }
     if focusable {
         let _ = win.set_focus();
     }
+}
+
+fn install_no_activate_hook(hwnd: HWND) {
+    unsafe {
+        let orig = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        ORIG_WND_PROC.store(orig, Ordering::Relaxed);
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, no_activate_wnd_proc as isize);
+    }
+}
+
+unsafe extern "system" fn set_child_no_activate(child: HWND, _: LPARAM) -> BOOL {
+    let ex = GetWindowLongPtrW(child, GWL_EXSTYLE);
+    SetWindowLongPtrW(child, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE.0 as isize);
+    BOOL(1)
 }
 
 fn apply_no_activate(hwnd: HWND, no_activate: bool) {
@@ -156,6 +195,7 @@ fn apply_no_activate(hwnd: HWND, no_activate: bool) {
             ex_style & !(WS_EX_NOACTIVATE.0 as isize)
         };
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+        EnumChildWindows(Some(hwnd), Some(set_child_no_activate), LPARAM(0));
     }
 }
 
