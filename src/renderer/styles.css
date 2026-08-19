@@ -118,6 +118,11 @@ body.collapsed #titlebar {
   overflow: hidden;
 }
 
+#champ-select-screen {
+  overflow-y: auto;
+  max-height: calc(100vh - 40px);
+}
+
 body.collapsed #content {
   display: none;
 }

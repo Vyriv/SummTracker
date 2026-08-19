@@ -153,7 +153,7 @@ fn scaled_height_for(width: u32, natural_height: f64) -> u32 {
 }
 
 fn champ_select_width(saved_width: u32) -> u32 {
-    saved_width.saturating_add(saved_width / 2).max(saved_width.saturating_add(140))
+    saved_width.saturating_add(saved_width * 3 / 4).max(saved_width.saturating_add(160))
 }
 
 fn overlay_size(state: &AppState) -> (u32, u32) {
@@ -167,6 +167,25 @@ fn overlay_size(state: &AppState) -> (u32, u32) {
     }
 }
 
+fn place_champ_select_window(win: &tauri::WebviewWindow, mut width: u32, mut height: u32) {
+    if let Some(monitor) = win
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| win.primary_monitor().ok().flatten())
+    {
+        let area = monitor.work_area();
+        width = width.min(area.size.width.max(1));
+        height = height.min(area.size.height.max(1));
+        let x = area.position.x + (area.size.width as i32 - width as i32) / 2;
+        let y = area.position.y + (area.size.height as i32 - height as i32) / 2;
+        let _ = win.set_size(PhysicalSize::new(width, height));
+        let _ = win.set_position(PhysicalPosition::new(x, y));
+        return;
+    }
+    let _ = win.set_size(PhysicalSize::new(width, height));
+}
+
 fn enter_champ_select_layout(app: &AppHandle, state: &AppState) {
     if *state.in_champ_select.lock().unwrap() {
         return;
@@ -177,7 +196,7 @@ fn enter_champ_select_layout(app: &AppHandle, state: &AppState) {
     }
     let (width, height) = overlay_size(state);
     if let Some(win) = app.get_webview_window("main") {
-        let _ = win.set_size(PhysicalSize::new(width, height));
+        place_champ_select_window(&win, width, height);
     }
 }
 
@@ -191,6 +210,9 @@ fn restore_saved_layout(app: &AppHandle, state: &AppState) {
     }
     let saved = state.expanded_bounds.lock().unwrap().clone();
     if let Some(win) = app.get_webview_window("main") {
+        if saved.x >= 0 {
+            let _ = win.set_position(PhysicalPosition::new(saved.x, saved.y));
+        }
         let _ = win.set_size(PhysicalSize::new(saved.width, saved.height));
     }
 }
@@ -330,12 +352,16 @@ fn set_natural_height(app: AppHandle, state: State<Arc<AppState>>, height: f64) 
     let Ok(size) = win.inner_size() else { return };
     let w = size.width;
     let h = scaled_height_for(w, height);
-    if size.height != h {
-        let _ = win.set_size(PhysicalSize::new(w, h));
-    }
 
     if *state.in_champ_select.lock().unwrap() {
+        if size.height != h {
+            place_champ_select_window(&win, w, h);
+        }
         return;
+    }
+
+    if size.height != h {
+        let _ = win.set_size(PhysicalSize::new(w, h));
     }
 
     let previous = state.expanded_bounds.lock().unwrap().clone();
@@ -1096,6 +1122,9 @@ pub fn run() {
                             }
                         }
                         tauri::WindowEvent::Moved(pos) => {
+                            if in_champ_select {
+                                return;
+                            }
                             let mut current = state_clone.expanded_bounds.lock().unwrap();
                             current.x = pos.x;
                             current.y = pos.y;
