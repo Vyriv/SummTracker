@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod champ_select;
 mod focus;
 mod lcu;
 mod live_game;
@@ -16,8 +17,11 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tokio::time::interval;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::core::{w, BOOL};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, EnumChildWindows,
     GetWindowLongPtrW, SetWindowLongPtrW,
@@ -52,7 +56,7 @@ fn debug_log(_message: &str) {
     eprintln!("[summtracker] {_message}");
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum GameState {
     Idle,
     ChampSelect,
@@ -174,13 +178,33 @@ fn load_settings(app: AppHandle) -> Value {
     result
 }
 
-#[tauri::command]
-fn save_settings(app: AppHandle, settings: Value) {
-    let path = data_path(&app, SETTINGS_FILE);
+fn save_settings_to_disk(app: &AppHandle, settings: &Value) {
+    let path = data_path(app, SETTINGS_FILE);
     eprintln!("[settings] save to {:?} => {}", path, settings);
-    if let Ok(json) = serde_json::to_string(&settings) {
+    if let Ok(json) = serde_json::to_string(settings) {
         let _ = std::fs::write(path, json);
     }
+}
+
+#[tauri::command]
+fn save_settings(app: AppHandle, settings: Value) {
+    save_settings_to_disk(&app, &settings);
+}
+
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let al = app.autolaunch();
+    if enabled {
+        al.enable().map_err(|e| e.to_string())?;
+    } else {
+        al.disable().map_err(|e| e.to_string())?;
+    }
+    Ok(al.is_enabled().unwrap_or(enabled))
 }
 
 #[tauri::command]
@@ -414,7 +438,7 @@ fn first_numeric(values: &[Option<&Value>]) -> Option<i64> {
 
 fn classify_queue_id(id: i64) -> Option<&'static str> {
     match id {
-        450 => Some("aram"),
+        450 | 930 | 1010 | 2400..=2409 => Some("aram"),
         1700..=1799 => Some("arena"),
         400 | 420 | 430 | 440 => Some("draft"),
         _ => None,
@@ -560,10 +584,10 @@ fn compute_room_id(players: &[Value], own_team: &str) -> Option<String> {
 // ── Game polling loop ──
 
 async fn game_loop(app: AppHandle, state: Arc<AppState>) {
-    let mut poll = interval(Duration::from_secs(3));
+    let mut delay = Duration::from_secs(3);
 
     loop {
-        poll.tick().await;
+        tokio::time::sleep(delay).await;
 
         let game_running = live_game::is_game_running().await;
         let current_state = state.game_state.lock().unwrap().clone();
@@ -688,6 +712,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                     let _ = win.hide();
                     let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
                 }
+                delay = Duration::from_secs(3);
                 continue;
             }
 
@@ -699,16 +724,32 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
             ));
             match (session, current_state) {
                 (Some(s), GameState::Idle) | (Some(s), GameState::ChampSelect) => {
-                    debug_log("entering/staying champ select");
+                    if !champ_select::is_swap_session(&s) {
+                        if current_state == GameState::ChampSelect {
+                            debug_log("non-bench champ select -> idle overlay");
+                            *state.game_state.lock().unwrap() = GameState::Idle;
+                            *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
+                            let win = app.get_webview_window("main").unwrap();
+                            let _ = win.hide();
+                            let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
+                        }
+                        delay = Duration::from_millis(500);
+                        continue;
+                    }
+
+                    let (gameflow, pickable) = tokio::join!(
+                        lcu::get_gameflow_session(),
+                        lcu::get_pickable_champions(),
+                    );
+                    let payload = champ_select::build_payload(&s, gameflow.as_ref(), pickable.as_ref());
+                    debug_log("entering/staying ARAM champ select");
                     *state.game_state.lock().unwrap() = GameState::ChampSelect;
-                    *state.latest_game_data.lock().unwrap() = serde_json::json!({
-                        "state": "champ-select",
-                        "session": s.clone(),
-                    });
-                    let _ = app.emit("game-data", serde_json::json!({
-                        "state": "champ-select",
-                        "session": s,
-                    }));
+                    *state.latest_game_data.lock().unwrap() = payload.clone();
+                    let win = app.get_webview_window("main").unwrap();
+                    let _ = win.show();
+                    let _ = app.emit("game-data", payload);
+                    delay = Duration::from_millis(250);
+                    continue;
                 }
                 (None, GameState::ChampSelect) => {
                     debug_log("champ select ended -> idle");
@@ -721,6 +762,18 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                 _ => {}
             }
         }
+
+        delay = match *state.game_state.lock().unwrap() {
+            GameState::ChampSelect => Duration::from_millis(250),
+            GameState::InGame => Duration::from_secs(3),
+            GameState::Idle => {
+                if lcu::is_client_running() {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(3)
+                }
+            }
+        };
     }
 }
 
@@ -838,8 +891,45 @@ async fn window_lock_loop(app: AppHandle, state: Arc<AppState>) {
 
 // ── Entry point ──
 
+fn acquire_single_instance() -> bool {
+    unsafe {
+        match CreateMutexW(None, true, w!("Local\\VyrivSummTrackerSingleton")) {
+            Ok(handle) => {
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(handle);
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_) => true,
+        }
+    }
+}
+
+fn ensure_default_autostart(app: &AppHandle) {
+    #[cfg(not(debug_assertions))]
+    {
+        let marker = data_path(app, "autostart-initialized");
+        if marker.exists() {
+            return;
+        }
+        if app.autolaunch().enable().is_ok() {
+            let _ = std::fs::write(marker, "1");
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        let _ = app;
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if !acquire_single_instance() {
+        return;
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -872,6 +962,7 @@ pub fn run() {
                 saved_settings.get("collapseBind").cloned().unwrap_or(Value::Null)
             ));
             apply_collapse_bind(&app.handle(), &state, saved_settings.get("collapseBind").cloned());
+            ensure_default_autostart(&app.handle());
 
             // Position window from saved bounds and apply no-activate so overlay never steals focus
             if let Some(win) = app.get_webview_window("main") {
@@ -978,12 +1069,20 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
+            get_autostart,
+            set_autostart,
             get_latest_game_data,
             toggle_collapse,
             set_focusable,
             set_natural_height,
             quit_app,
             update_collapse_bind,
+            champ_select::swap_bench,
+            champ_select::complete_pick,
+            champ_select::request_trade,
+            champ_select::accept_trade,
+            champ_select::decline_trade,
+            champ_select::reroll_champion,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

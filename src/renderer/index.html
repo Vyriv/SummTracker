@@ -44,6 +44,10 @@
           <button id="s-collapse-bind" class="bind-btn">None</button>
         </div>
         <div class="setting-row">
+          <span class="setting-label">Launch on startup</span>
+          <label class="toggle"><input type="checkbox" id="s-autostart"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
           <span class="setting-label">Background opacity</span>
           <div class="opacity-control">
             <input type="range" id="s-opacity" min="0" max="100" step="5" value="90" />
@@ -54,6 +58,29 @@
 
       <div id="idle-screen" class="screen">
         <div class="waiting">Waiting for game...</div>
+      </div>
+
+      <div id="champ-select-screen" class="screen hidden">
+        <div class="cs-header">
+          <div>
+            <div id="cs-mode-label" class="team-label ally-label">ARAM</div>
+            <div id="cs-you" class="cs-you"></div>
+          </div>
+          <button id="cs-reroll-btn" class="reroll-btn hidden" type="button">Reroll</button>
+        </div>
+        <div id="cs-status" class="cs-status"></div>
+        <div id="cs-cards-wrap" class="cs-section hidden">
+          <div class="team-label">Your cards</div>
+          <div id="cs-cards" class="bench-grid"></div>
+        </div>
+        <div id="cs-allies-wrap" class="cs-section">
+          <div class="team-label ally-label">Allies</div>
+          <div id="cs-allies"></div>
+        </div>
+        <div id="cs-bench-wrap" class="cs-section">
+          <div class="team-label">Bench - click to swap</div>
+          <div id="cs-bench" class="bench-grid"></div>
+        </div>
       </div>
 
       <div id="game-screen" class="screen hidden">

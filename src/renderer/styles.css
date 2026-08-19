@@ -401,3 +401,119 @@ body.collapsed #content {
 body.hide-champ-name .champion-name { display: none; }
 body.hide-summoner-name .player-name { display: none; }
 body.hide-own-team .own-team { display: none; }
+
+/* ── ARAM champ select swap ── */
+.cs-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.cs-you {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.cs-section {
+  margin-top: 8px;
+}
+
+.cs-status {
+  min-height: 14px;
+  font-size: 10px;
+  color: #888;
+  padding: 0 4px 4px;
+}
+
+.cs-status.error { color: #ff6b6b; }
+.cs-status.ok { color: #6ecf8e; }
+
+.reroll-btn {
+  -webkit-app-region: no-drag;
+  background: #1a1a2e;
+  border: 1px solid rgba(160, 120, 220, 0.5);
+  color: #c8b4f0;
+  font-size: 10px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.reroll-btn:hover { border-color: #a078dc; color: #fff; }
+.reroll-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.bench-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 0;
+}
+
+.champ-tile {
+  -webkit-app-region: no-drag;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 4px;
+  background: #111;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  overflow: hidden;
+  position: relative;
+}
+.champ-tile img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+}
+.champ-tile:hover { border-color: #c8aa5a; }
+.champ-tile.local { border-color: rgba(74, 158, 255, 0.8); cursor: default; }
+.champ-tile.disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.champ-tile.incoming { border-color: #6ecf8e; box-shadow: 0 0 6px rgba(110, 207, 142, 0.4); }
+.champ-tile.busy { opacity: 0.55; }
+
+.ally-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 2px;
+  border-radius: 4px;
+}
+.ally-row:hover { background: rgba(255, 255, 255, 0.04); }
+.ally-row .champion-icon { width: 28px; height: 28px; }
+.ally-action {
+  -webkit-app-region: no-drag;
+  margin-left: auto;
+  background: #1a1a2e;
+  border: 1px solid #333;
+  color: #c8aa5a;
+  font-size: 9px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 3px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.ally-action:hover { border-color: #c8aa5a; }
+.ally-action.accept {
+  border-color: rgba(110, 207, 142, 0.6);
+  color: #6ecf8e;
+}
+.ally-action:disabled {
+  opacity: 0.35;
+  cursor: default;
+  color: #666;
+  border-color: #333;
+}

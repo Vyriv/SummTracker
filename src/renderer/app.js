@@ -108,6 +108,18 @@ function initSettingsPanel() {
     applySettings();
   });
 
+  const autostartToggle = document.getElementById('s-autostart');
+  if (autostartToggle) {
+    invoke('get_autostart').then(enabled => {
+      autostartToggle.checked = Boolean(enabled);
+    }).catch(() => {});
+    autostartToggle.addEventListener('change', e => {
+      invoke('set_autostart', { enabled: e.target.checked }).catch(() => {
+        e.target.checked = !e.target.checked;
+      });
+    });
+  }
+
   const bindBtn = document.getElementById('s-collapse-bind');
   let listeningForBind = false;
 
@@ -162,8 +174,9 @@ function toggleSettings() {
   document.getElementById('settings-panel').classList.toggle('hidden', !settingsOpen);
   document.getElementById('game-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'game-screen');
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'idle-screen');
+  document.getElementById('champ-select-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'champ-select-screen');
 
-  invoke('set_focusable', { focusable: settingsOpen });
+  invoke('set_focusable', { focusable: settingsOpen || currentScreen === 'champ-select-screen' });
   syncGameHeight();
 }
 
@@ -187,10 +200,17 @@ function syncGameHeight() {
 new ResizeObserver(updateScale).observe(document.body);
 
 let DDragon = 'https://ddragon.leagueoflegends.com/cdn/14.24.1';
+const champById = {};
 
 fetch('https://ddragon.leagueoflegends.com/api/versions.json')
   .then(r => r.json())
-  .then(versions => { DDragon = `https://ddragon.leagueoflegends.com/cdn/${versions[0]}`; })
+  .then(async versions => {
+    DDragon = `https://ddragon.leagueoflegends.com/cdn/${versions[0]}`;
+    const data = await fetch(`${DDragon}/data/en_US/champion.json`).then(r => r.json());
+    Object.values(data.data || {}).forEach(champ => {
+      champById[Number(champ.key)] = { id: champ.id, name: champ.name };
+    });
+  })
   .catch(() => {});
 
 // ── Supabase room sync ──
@@ -568,6 +588,205 @@ function showScreen(id) {
   currentScreen = id;
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || id !== 'idle-screen');
   document.getElementById('game-screen').classList.toggle('hidden', settingsOpen || id !== 'game-screen');
+  document.getElementById('champ-select-screen').classList.toggle('hidden', settingsOpen || id !== 'champ-select-screen');
+}
+
+function champName(id) {
+  return champById[id]?.name || (id ? `Champ ${id}` : 'None');
+}
+
+function champSelectIconUrl(id) {
+  return `https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/${id}.png`;
+}
+
+function setChampSelectStatus(message, kind = '') {
+  const el = document.getElementById('cs-status');
+  el.textContent = message || '';
+  el.className = `cs-status${kind ? ` ${kind}` : ''}`;
+}
+
+let champSelectBusy = false;
+let lastChampSelect = null;
+let lastChampSelectKey = '';
+
+function makeChampTile(championId, title, className = '') {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `champ-tile${className ? ` ${className}` : ''}`;
+  btn.title = title;
+  btn.dataset.championId = String(championId);
+  const img = document.createElement('img');
+  img.src = champSelectIconUrl(championId);
+  img.alt = champName(championId);
+  img.onerror = () => { img.style.background = '#222'; };
+  btn.appendChild(img);
+  return btn;
+}
+
+async function clickChampSelectChampion(championId) {
+  if (champSelectBusy || !championId) return;
+  const session = lastChampSelect;
+  champSelectBusy = true;
+  try {
+    if (session?.pickActionId != null && !session.myChampionId) {
+      await invoke('complete_pick', { actionId: session.pickActionId, championId });
+      setChampSelectStatus(`Picked ${champName(championId)}`, 'ok');
+    } else {
+      await invoke('swap_bench', { championId });
+      setChampSelectStatus(`Swapped to ${champName(championId)}`, 'ok');
+    }
+  } catch (err) {
+    setChampSelectStatus(String(err).replace(/^LCU \d+ [^:]+:\s*/, '') || 'Swap failed', 'error');
+  } finally {
+    champSelectBusy = false;
+  }
+}
+
+async function clickAllyTrade(ally) {
+  if (champSelectBusy || ally?.tradeId == null) return;
+  const state = String(ally.tradeState || '').toUpperCase();
+  const kind = ally.tradeKind || 'trade';
+  champSelectBusy = true;
+  try {
+    if (state === 'RECEIVED') {
+      await invoke('accept_trade', { tradeId: ally.tradeId, kind });
+      setChampSelectStatus(`Accepted trade for ${champName(ally.championId)}`, 'ok');
+    } else if (state === 'AVAILABLE') {
+      await invoke('request_trade', { tradeId: ally.tradeId, kind });
+      setChampSelectStatus(`Trade requested for ${champName(ally.championId)}`, 'ok');
+    }
+  } catch (err) {
+    setChampSelectStatus(String(err).replace(/^LCU \d+ [^:]+:\s*/, '') || 'Trade failed', 'error');
+  } finally {
+    champSelectBusy = false;
+  }
+}
+
+function champSelectKey(data) {
+  return JSON.stringify({
+    mode: data.mode,
+    my: data.myChampionId,
+    pick: data.pickActionId,
+    rerolls: data.rerolls,
+    allow: data.allowRerolling,
+    bench: data.bench,
+    cards: data.cards,
+    allies: (data.allies || []).map(a => [
+      a.cellId, a.championId, a.tradeState, a.tradeId, a.displayName, a.tradeKind,
+    ]),
+  });
+}
+
+function renderChampSelect(data) {
+  const key = champSelectKey(data);
+  if (key === lastChampSelectKey) {
+    lastChampSelect = data;
+    return;
+  }
+  lastChampSelectKey = key;
+  lastChampSelect = data;
+  const modeLabel = document.getElementById('cs-mode-label');
+  modeLabel.textContent = data.mode || 'ARAM';
+
+  const youEl = document.getElementById('cs-you');
+  youEl.innerHTML = '';
+  const myId = data.myChampionId || 0;
+  if (myId) {
+    const tile = makeChampTile(myId, champName(myId), 'local');
+    youEl.appendChild(tile);
+    const name = document.createElement('div');
+    name.className = 'player-info';
+    name.innerHTML = `<div class="player-name">${champName(myId)}</div><div class="champion-name">You</div>`;
+    youEl.appendChild(name);
+  } else {
+    const waiting = document.createElement('div');
+    waiting.className = 'champion-name';
+    waiting.textContent = data.pickActionId != null ? 'Pick one of your cards' : 'Waiting for champion...';
+    youEl.appendChild(waiting);
+  }
+
+  const rerollBtn = document.getElementById('cs-reroll-btn');
+  const rerolls = Number(data.rerolls || 0);
+  const canReroll = Boolean(data.allowRerolling) && rerolls > 0;
+  rerollBtn.classList.toggle('hidden', !data.allowRerolling && rerolls <= 0);
+  rerollBtn.disabled = !canReroll;
+  rerollBtn.textContent = rerolls > 0 ? `Reroll (${rerolls})` : 'Reroll';
+
+  const cards = Array.isArray(data.cards) ? data.cards.filter(id => id > 0) : [];
+  const cardsWrap = document.getElementById('cs-cards-wrap');
+  const cardsEl = document.getElementById('cs-cards');
+  cardsEl.innerHTML = '';
+  const showCards = cards.length > 0 && !myId;
+  cardsWrap.classList.toggle('hidden', !showCards);
+  if (showCards) {
+    cards.forEach(id => {
+      const tile = makeChampTile(id, `Pick ${champName(id)}`);
+      tile.addEventListener('click', () => clickChampSelectChampion(id));
+      cardsEl.appendChild(tile);
+    });
+  }
+
+  const alliesEl = document.getElementById('cs-allies');
+  alliesEl.innerHTML = '';
+  (data.allies || []).forEach(ally => {
+    if (ally.isLocal) return;
+    const row = document.createElement('div');
+    row.className = 'ally-row';
+    const state = String(ally.tradeState || '').toUpperCase();
+
+    const img = document.createElement('img');
+    img.className = 'champion-icon';
+    img.src = ally.championId ? champSelectIconUrl(ally.championId) : '';
+    img.alt = champName(ally.championId);
+    if (state === 'AVAILABLE' || state === 'RECEIVED') {
+      img.style.cursor = 'pointer';
+      img.addEventListener('click', () => clickAllyTrade(ally));
+    }
+    row.appendChild(img);
+
+    const info = document.createElement('div');
+    info.className = 'player-info';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'player-name';
+    nameEl.textContent = ally.displayName || champName(ally.championId);
+    const champEl = document.createElement('div');
+    champEl.className = 'champion-name';
+    champEl.textContent = champName(ally.championId);
+    info.appendChild(nameEl);
+    info.appendChild(champEl);
+    row.appendChild(info);
+
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'ally-action';
+    if (state === 'RECEIVED') {
+      action.textContent = 'Accept';
+      action.classList.add('accept');
+      action.addEventListener('click', () => clickAllyTrade(ally));
+    } else if (state === 'SENT') {
+      action.textContent = 'Sent';
+      action.disabled = true;
+    } else if (state === 'AVAILABLE') {
+      action.textContent = 'Trade';
+      action.addEventListener('click', () => clickAllyTrade(ally));
+    } else {
+      action.textContent = state === 'BUSY' ? 'Busy' : 'Locked';
+      action.disabled = true;
+    }
+    row.appendChild(action);
+    alliesEl.appendChild(row);
+  });
+
+  const bench = Array.isArray(data.bench) ? data.bench.filter(id => id > 0) : [];
+  const benchWrap = document.getElementById('cs-bench-wrap');
+  const benchEl = document.getElementById('cs-bench');
+  benchEl.innerHTML = '';
+  benchWrap.classList.toggle('hidden', bench.length === 0);
+  bench.forEach(id => {
+    const tile = makeChampTile(id, `Swap to ${champName(id)}`);
+    tile.addEventListener('click', () => clickChampSelectChampion(id));
+    benchEl.appendChild(tile);
+  });
 }
 
 function applySyncCooldownEvent(event) {
@@ -596,15 +815,31 @@ function handleGameData(data) {
     ownTeam = data.ownTeam || null;
     const enriched = data.players.map(enrichPlayer);
     renderPlayers(enriched);
+    document.getElementById('titlebar-label').textContent = 'SummTracker';
     showScreen('game-screen');
+    if (!settingsOpen) invoke('set_focusable', { focusable: false });
     syncGameHeight();
     syncToRoom(data.roomId || null);
+  } else if (data.state === 'champ-select' && data.benchEnabled) {
+    resetAllCooldowns();
+    enemyPlayerIndices = [];
+    pendingSyncEvents = [];
+    syncToRoom(null);
+    renderChampSelect(data);
+    document.getElementById('titlebar-label').textContent = data.mode || 'ARAM';
+    showScreen('champ-select-screen');
+    invoke('set_focusable', { focusable: true });
+    syncGameHeight();
   } else {
     resetAllCooldowns();
     enemyPlayerIndices = [];
     pendingSyncEvents = [];
     syncToRoom(null);
+    document.getElementById('titlebar-label').textContent = 'SummTracker';
     showScreen('idle-screen');
+    lastChampSelect = null;
+    lastChampSelectKey = '';
+    if (!settingsOpen) invoke('set_focusable', { focusable: false });
   }
 }
 
@@ -618,6 +853,19 @@ document.getElementById('settings-btn').addEventListener('click', toggleSettings
 
 document.getElementById('close-btn').addEventListener('click', () => {
   invoke('quit_app');
+});
+
+document.getElementById('cs-reroll-btn').addEventListener('click', async () => {
+  if (champSelectBusy) return;
+  champSelectBusy = true;
+  try {
+    await invoke('reroll_champion');
+    setChampSelectStatus('Rerolled', 'ok');
+  } catch (err) {
+    setChampSelectStatus(String(err).replace(/^LCU \d+ [^:]+:\s*/, '') || 'Reroll failed', 'error');
+  } finally {
+    champSelectBusy = false;
+  }
 });
 
 window.addEventListener('keydown', (event) => {
