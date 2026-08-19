@@ -258,9 +258,3 @@ pub async fn decline_trade(trade_id: i64, kind: Option<String>) -> Result<(), St
     lcu::lcu_post(&trade_path(kind.as_deref().unwrap_or("trade"), trade_id, "decline")).await?;
     Ok(())
 }
-
-#[tauri::command]
-pub async fn reroll_champion() -> Result<(), String> {
-    lcu::lcu_post("/lol-champ-select/v1/session/my-selection/reroll").await?;
-    Ok(())
-}

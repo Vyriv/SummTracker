@@ -85,6 +85,7 @@ struct AppState {
     settings_open: Mutex<bool>,
     current_shortcut: Mutex<Option<String>>,
     latest_game_data: Mutex<Value>,
+    in_champ_select: Mutex<bool>,
 }
 
 fn data_path(app: &AppHandle, file: &str) -> std::path::PathBuf {
@@ -149,6 +150,49 @@ fn scaled_height_for(width: u32, natural_height: f64) -> u32 {
     ((natural_height * width as f64) / NATURAL_WIDTH as f64)
         .round()
         .max(COLLAPSED_HEIGHT as f64) as u32
+}
+
+fn champ_select_width(saved_width: u32) -> u32 {
+    saved_width.saturating_add(saved_width / 2).max(saved_width.saturating_add(140))
+}
+
+fn overlay_size(state: &AppState) -> (u32, u32) {
+    let saved = state.expanded_bounds.lock().unwrap().clone();
+    let natural = *state.natural_height.lock().unwrap();
+    if *state.in_champ_select.lock().unwrap() {
+        let width = champ_select_width(saved.width);
+        (width, scaled_height_for(width, natural))
+    } else {
+        (saved.width, saved.height)
+    }
+}
+
+fn enter_champ_select_layout(app: &AppHandle, state: &AppState) {
+    if *state.in_champ_select.lock().unwrap() {
+        return;
+    }
+    *state.in_champ_select.lock().unwrap() = true;
+    if *state.is_collapsed.lock().unwrap() {
+        return;
+    }
+    let (width, height) = overlay_size(state);
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_size(PhysicalSize::new(width, height));
+    }
+}
+
+fn restore_saved_layout(app: &AppHandle, state: &AppState) {
+    if !*state.in_champ_select.lock().unwrap() {
+        return;
+    }
+    *state.in_champ_select.lock().unwrap() = false;
+    if *state.is_collapsed.lock().unwrap() {
+        return;
+    }
+    let saved = state.expanded_bounds.lock().unwrap().clone();
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_size(PhysicalSize::new(saved.width, saved.height));
+    }
 }
 
 // ── Tauri commands ──
@@ -218,19 +262,18 @@ fn get_latest_game_data(state: State<Arc<AppState>>) -> Value {
 fn toggle_collapse(app: AppHandle, state: State<Arc<AppState>>) {
     let win = app.get_webview_window("main").unwrap();
 
-    let (is_collapsed, bounds) = {
+    let (is_collapsed, width, height) = {
         let mut collapsed = state.is_collapsed.lock().unwrap();
         *collapsed = !*collapsed;
         let is_collapsed = *collapsed;
-        let bounds = state.expanded_bounds.lock().unwrap().clone();
-        (is_collapsed, bounds)
-    }; // locks released here before any window calls
+        let (width, height) = overlay_size(&state);
+        (is_collapsed, width, height)
+    };
 
     if is_collapsed {
-        let w = bounds.width;
-        let _ = win.set_size(PhysicalSize::new(w, COLLAPSED_HEIGHT));
+        let _ = win.set_size(PhysicalSize::new(width, COLLAPSED_HEIGHT));
     } else {
-        let _ = win.set_size(PhysicalSize::new(bounds.width, bounds.height));
+        let _ = win.set_size(PhysicalSize::new(width, height));
     }
 
     let _ = app.emit("sync-collapse", is_collapsed);
@@ -291,6 +334,10 @@ fn set_natural_height(app: AppHandle, state: State<Arc<AppState>>, height: f64) 
         let _ = win.set_size(PhysicalSize::new(w, h));
     }
 
+    if *state.in_champ_select.lock().unwrap() {
+        return;
+    }
+
     let previous = state.expanded_bounds.lock().unwrap().clone();
     let pos = win.outer_position().ok();
     let bounds = Bounds {
@@ -336,17 +383,24 @@ fn apply_collapse_bind(app: &AppHandle, state: &Arc<AppState>, bind: Option<Valu
 
             if is_collapsed {
                 if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
-                    let bounds = Bounds { x: pos.x, y: pos.y, width: size.width, height: size.height };
-                    *state_clone.expanded_bounds.lock().unwrap() = bounds.clone();
-                    save_bounds_to_disk(&app_clone, &bounds);
+                    if !*state_clone.in_champ_select.lock().unwrap() {
+                        let bounds = Bounds { x: pos.x, y: pos.y, width: size.width, height: size.height };
+                        *state_clone.expanded_bounds.lock().unwrap() = bounds.clone();
+                        save_bounds_to_disk(&app_clone, &bounds);
+                    } else {
+                        let mut saved = state_clone.expanded_bounds.lock().unwrap();
+                        saved.x = pos.x;
+                        saved.y = pos.y;
+                        save_bounds_to_disk(&app_clone, &saved);
+                    }
                     let _ = win.set_size(PhysicalSize::new(size.width, COLLAPSED_HEIGHT));
                 } else {
-                    let width = state_clone.expanded_bounds.lock().unwrap().width;
+                    let (width, _) = overlay_size(&state_clone);
                     let _ = win.set_size(PhysicalSize::new(width, COLLAPSED_HEIGHT));
                 }
             } else {
-                let bounds = state_clone.expanded_bounds.lock().unwrap().clone();
-                let _ = win.set_size(PhysicalSize::new(bounds.width, bounds.height));
+                let (width, height) = overlay_size(&state_clone);
+                let _ = win.set_size(PhysicalSize::new(width, height));
             }
 
             let _ = app_clone.emit("sync-collapse", is_collapsed);
@@ -659,6 +713,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
             };
             debug_log(&format!("own_team='{}' room_id={:?}", own_team, room_id));
 
+            restore_saved_layout(&app, &state);
             *state.game_state.lock().unwrap() = GameState::InGame;
             let game_data = serde_json::json!({
                 "state": "in-game",
@@ -694,6 +749,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
 
         if !game_running && current_state == GameState::InGame {
             debug_log("leaving in-game -> idle");
+            restore_saved_layout(&app, &state);
             *state.game_state.lock().unwrap() = GameState::Idle;
             *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
             let win = app.get_webview_window("main").unwrap();
@@ -706,6 +762,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
             if !lcu::is_client_running() {
                 if current_state != GameState::Idle {
                     debug_log("league client not running -> idle");
+                    restore_saved_layout(&app, &state);
                     *state.game_state.lock().unwrap() = GameState::Idle;
                     *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
                     let win = app.get_webview_window("main").unwrap();
@@ -727,6 +784,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                     if !champ_select::is_swap_session(&s) {
                         if current_state == GameState::ChampSelect {
                             debug_log("non-bench champ select -> idle overlay");
+                            restore_saved_layout(&app, &state);
                             *state.game_state.lock().unwrap() = GameState::Idle;
                             *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
                             let win = app.get_webview_window("main").unwrap();
@@ -743,6 +801,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                     );
                     let payload = champ_select::build_payload(&s, gameflow.as_ref(), pickable.as_ref());
                     debug_log("entering/staying ARAM champ select");
+                    enter_champ_select_layout(&app, &state);
                     *state.game_state.lock().unwrap() = GameState::ChampSelect;
                     *state.latest_game_data.lock().unwrap() = payload.clone();
                     let win = app.get_webview_window("main").unwrap();
@@ -753,6 +812,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                 }
                 (None, GameState::ChampSelect) => {
                     debug_log("champ select ended -> idle");
+                    restore_saved_layout(&app, &state);
                     *state.game_state.lock().unwrap() = GameState::Idle;
                     *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
                     let win = app.get_webview_window("main").unwrap();
@@ -953,6 +1013,7 @@ pub fn run() {
                 settings_open: Mutex::new(false),
                 current_shortcut: Mutex::new(None),
                 latest_game_data: Mutex::new(serde_json::json!({ "state": "idle" })),
+                in_champ_select: Mutex::new(false),
             });
 
             app.manage(state.clone());
@@ -1009,12 +1070,17 @@ pub fn run() {
                     }
 
                     let win = app_handle.get_webview_window("main").unwrap();
+                    let in_champ_select = *state_clone.in_champ_select.lock().unwrap();
                     match event {
                         tauri::WindowEvent::Resized(size) => {
                             let natural_height = *state_clone.natural_height.lock().unwrap();
                             let target_height = scaled_height_for(size.width, natural_height);
                             if size.height != target_height {
                                 let _ = win.set_size(PhysicalSize::new(size.width, target_height));
+                                return;
+                            }
+
+                            if in_champ_select {
                                 return;
                             }
 
@@ -1030,15 +1096,12 @@ pub fn run() {
                             }
                         }
                         tauri::WindowEvent::Moved(pos) => {
-                            let current = state_clone.expanded_bounds.lock().unwrap().clone();
-                            let b = Bounds {
-                                x: pos.x,
-                                y: pos.y,
-                                width: current.width,
-                                height: current.height,
-                            };
-                            *state_clone.expanded_bounds.lock().unwrap() = b.clone();
-                            save_bounds_to_disk(&app_handle, &b);
+                            let mut current = state_clone.expanded_bounds.lock().unwrap();
+                            current.x = pos.x;
+                            current.y = pos.y;
+                            let saved = current.clone();
+                            drop(current);
+                            save_bounds_to_disk(&app_handle, &saved);
                         }
                         _ => {}
                     }
@@ -1082,7 +1145,6 @@ pub fn run() {
             champ_select::request_trade,
             champ_select::accept_trade,
             champ_select::decline_trade,
-            champ_select::reroll_champion,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

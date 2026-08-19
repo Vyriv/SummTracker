@@ -667,8 +667,6 @@ function champSelectKey(data) {
     mode: data.mode,
     my: data.myChampionId,
     pick: data.pickActionId,
-    rerolls: data.rerolls,
-    allow: data.allowRerolling,
     bench: data.bench,
     cards: data.cards,
     allies: (data.allies || []).map(a => [
@@ -704,13 +702,6 @@ function renderChampSelect(data) {
     waiting.textContent = data.pickActionId != null ? 'Pick one of your cards' : 'Waiting for champion...';
     youEl.appendChild(waiting);
   }
-
-  const rerollBtn = document.getElementById('cs-reroll-btn');
-  const rerolls = Number(data.rerolls || 0);
-  const canReroll = Boolean(data.allowRerolling) && rerolls > 0;
-  rerollBtn.classList.toggle('hidden', !data.allowRerolling && rerolls <= 0);
-  rerollBtn.disabled = !canReroll;
-  rerollBtn.textContent = rerolls > 0 ? `Reroll (${rerolls})` : 'Reroll';
 
   const cards = Array.isArray(data.cards) ? data.cards.filter(id => id > 0) : [];
   const cardsWrap = document.getElementById('cs-cards-wrap');
@@ -853,19 +844,6 @@ document.getElementById('settings-btn').addEventListener('click', toggleSettings
 
 document.getElementById('close-btn').addEventListener('click', () => {
   invoke('quit_app');
-});
-
-document.getElementById('cs-reroll-btn').addEventListener('click', async () => {
-  if (champSelectBusy) return;
-  champSelectBusy = true;
-  try {
-    await invoke('reroll_champion');
-    setChampSelectStatus('Rerolled', 'ok');
-  } catch (err) {
-    setChampSelectStatus(String(err).replace(/^LCU \d+ [^:]+:\s*/, '') || 'Reroll failed', 'error');
-  } finally {
-    champSelectBusy = false;
-  }
 });
 
 window.addEventListener('keydown', (event) => {
