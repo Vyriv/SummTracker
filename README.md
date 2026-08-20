@@ -1,5 +1,7 @@
 # SummTracker
 
+[![Join the Discord](https://img.shields.io/discord/1487928162636533871?label=Join%20the%20Discord&logo=discord&color=5865F2&logoColor=white)](https://discord.gg/R5NdTVRDpb)
+
 A lightweight Tauri desktop overlay for League of Legends that tracks summoner spell and ultimate cooldowns for all 10 players in real time. Also does insta swapping in ARAM / ARAM Mayhem champ select.
 
 ![SummTracker overlay](assets/preview.png)
