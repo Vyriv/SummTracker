@@ -48,6 +48,10 @@
           <label class="toggle"><input type="checkbox" id="s-autostart"><span class="slider"></span></label>
         </div>
         <div class="setting-row">
+          <span class="setting-label">Auto accept queue</span>
+          <label class="toggle"><input type="checkbox" id="s-auto-accept"><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
           <span class="setting-label">Background opacity</span>
           <div class="opacity-control">
             <input type="range" id="s-opacity" min="0" max="100" step="5" value="90" />
@@ -67,7 +71,7 @@
         </div>
         <div id="cs-status" class="cs-status"></div>
         <div id="cs-cards-wrap" class="cs-section hidden">
-          <div class="team-label">Your cards</div>
+          <div class="team-label">Your cards - click to pick</div>
           <div id="cs-cards" class="bench-grid"></div>
         </div>
         <div id="cs-allies-wrap" class="cs-section">
@@ -75,7 +79,7 @@
           <div id="cs-allies"></div>
         </div>
         <div id="cs-bench-wrap" class="cs-section">
-          <div class="team-label">Bench - click to swap</div>
+          <div class="team-label">Bench - click to swap or queue</div>
           <div id="cs-bench" class="bench-grid"></div>
         </div>
       </div>

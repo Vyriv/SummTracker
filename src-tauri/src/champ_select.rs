@@ -69,6 +69,56 @@ fn pickable_ids(pickable: Option<&Value>) -> Vec<i64> {
     ids.iter().filter_map(json_i64).filter(|id| *id > 0).collect()
 }
 
+fn subset_card_ids(subset: Option<&Value>) -> Vec<i64> {
+    let Some(value) = subset else { return Vec::new() };
+    let ids = value
+        .get("championIds")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    ids.iter().filter_map(json_i64).filter(|id| *id > 0).collect()
+}
+
+fn action_card_ids(session: &Value, local_cell: i64) -> Vec<i64> {
+    for action in iter_actions(session) {
+        let actor = json_i64(&action["actorCellId"]).unwrap_or(-1);
+        if actor != local_cell {
+            continue;
+        }
+        if let Some(ids) = action.get("championIds").and_then(Value::as_array) {
+            let cards: Vec<i64> = ids.iter().filter_map(json_i64).filter(|id| *id > 0).collect();
+            if !cards.is_empty() {
+                return cards;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn card_ids(
+    session: &Value,
+    local_cell: i64,
+    subset: Option<&Value>,
+    pickable: Option<&Value>,
+) -> Vec<i64> {
+    let subset_cards = subset_card_ids(subset);
+    if !subset_cards.is_empty() && subset_cards.len() <= 6 {
+        return subset_cards;
+    }
+
+    let action_cards = action_card_ids(session, local_cell);
+    if !action_cards.is_empty() {
+        return action_cards;
+    }
+
+    let mut pickable_cards = pickable_ids(pickable);
+    if pickable_cards.len() > 6 {
+        pickable_cards.truncate(6);
+    }
+    pickable_cards
+}
+
 fn iter_actions(session: &Value) -> Vec<&Value> {
     let mut out = Vec::new();
     if let Some(arr) = session.get("actions").and_then(Value::as_array) {
@@ -96,6 +146,46 @@ fn local_pick_action_id(session: &Value, local_cell: i64) -> Option<i64> {
     })
 }
 
+fn push_swap_entries(
+    session: &Value,
+    key: &str,
+    kind: &'static str,
+    trades: &mut Vec<(i64, i64, String, &'static str)>,
+) {
+    if let Some(arr) = session.get(key).and_then(Value::as_array) {
+        for trade in arr {
+            if let (Some(id), Some(cell)) = (json_i64(&trade["id"]), json_i64(&trade["cellId"])) {
+                trades.push((
+                    id,
+                    cell,
+                    trade["state"].as_str().unwrap_or("UNAVAILABLE").to_string(),
+                    kind,
+                ));
+            }
+        }
+    }
+}
+
+fn trade_priority(state: &str) -> u8 {
+    match state.to_uppercase() {
+        s if s == "RECEIVED" => 4,
+        s if s == "AVAILABLE" => 3,
+        s if s == "SENT" => 2,
+        s if s == "BUSY" => 1,
+        _ => 0,
+    }
+}
+
+fn trade_for_cell<'a>(
+    trades: &'a [(i64, i64, String, &'static str)],
+    cell_id: i64,
+) -> Option<&'a (i64, i64, String, &'static str)> {
+    trades
+        .iter()
+        .filter(|(_, cell, _, _)| *cell == cell_id)
+        .max_by_key(|(_, _, state, _)| trade_priority(state))
+}
+
 fn member_name(member: &Value) -> String {
     [
         member.get("gameName").and_then(Value::as_str),
@@ -112,52 +202,35 @@ fn member_name(member: &Value) -> String {
 
 fn trade_entries(session: &Value) -> Vec<(i64, i64, String, &'static str)> {
     let mut trades = Vec::new();
-
-    if let Some(arr) = session.get("championSwaps").and_then(Value::as_array) {
-        for trade in arr {
-            if let (Some(id), Some(cell)) = (json_i64(&trade["id"]), json_i64(&trade["cellId"])) {
-                trades.push((
-                    id,
-                    cell,
-                    trade["state"].as_str().unwrap_or("UNAVAILABLE").to_string(),
-                    "champion-swap",
-                ));
-            }
-        }
-    }
-
-    if trades.is_empty() {
-        if let Some(arr) = session.get("trades").and_then(Value::as_array) {
-            for trade in arr {
-                if let (Some(id), Some(cell)) = (json_i64(&trade["id"]), json_i64(&trade["cellId"])) {
-                    trades.push((
-                        id,
-                        cell,
-                        trade["state"].as_str().unwrap_or("UNAVAILABLE").to_string(),
-                        "trade",
-                    ));
-                }
-            }
-        }
-    }
-
+    push_swap_entries(session, "championSwaps", "champion-swap", &mut trades);
+    push_swap_entries(session, "trades", "trade", &mut trades);
+    push_swap_entries(session, "positionSwaps", "position-swap", &mut trades);
+    push_swap_entries(session, "pickOrderSwaps", "pick-order-swap", &mut trades);
     trades
 }
 
 pub fn is_swap_session(session: &Value) -> bool {
-    session.get("benchEnabled").and_then(Value::as_bool).unwrap_or(false)
-        || !bench_ids(session).is_empty()
+    if session.get("benchEnabled").and_then(Value::as_bool).unwrap_or(false) {
+        return true;
+    }
+    if !bench_ids(session).is_empty() {
+        return true;
+    }
+    // ARAM / Mayhem before bench ids populate still has rerolls.
+    session.get("allowRerolling").and_then(Value::as_bool).unwrap_or(false)
 }
 
-pub fn build_payload(session: &Value, gameflow: Option<&Value>, pickable: Option<&Value>) -> Value {
+pub fn build_payload(
+    session: &Value,
+    gameflow: Option<&Value>,
+    pickable: Option<&Value>,
+    subset: Option<&Value>,
+) -> Value {
     let local_cell = json_i64(&session["localPlayerCellId"]).unwrap_or(-1);
     let my_team = session.get("myTeam").and_then(Value::as_array).cloned().unwrap_or_default();
     let trades = trade_entries(session);
     let bench = bench_ids(session);
-    let mut cards = pickable_ids(pickable);
-    if cards.len() > 6 {
-        cards.clear();
-    }
+    let cards = card_ids(session, local_cell, subset, pickable);
 
     let mut my_champion_id = 0i64;
     let allies: Vec<Value> = my_team
@@ -169,7 +242,7 @@ pub fn build_payload(session: &Value, gameflow: Option<&Value>, pickable: Option
             if is_local {
                 my_champion_id = champion_id;
             }
-            let trade = trades.iter().find(|(_, cell, _, _)| *cell == cell_id);
+            let trade = trade_for_cell(&trades, cell_id);
             json!({
                 "cellId": cell_id,
                 "championId": champion_id,
@@ -222,23 +295,38 @@ pub async fn swap_bench(champion_id: i64) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn complete_pick(action_id: i64, champion_id: i64) -> Result<(), String> {
-    if action_id < 0 || champion_id <= 0 {
-        return Err("Invalid pick".to_string());
+    if champion_id <= 0 {
+        return Err("Invalid champion".to_string());
     }
+
+    if action_id >= 0 {
+        let path = format!("/lol-champ-select/v1/session/actions/{action_id}");
+        let body = json!({ "championId": champion_id, "completed": true });
+        if lcu::lcu_patch(&path, body).await.is_ok() {
+            return Ok(());
+        }
+        let complete_path = format!("/lol-champ-select/v1/session/actions/{action_id}/complete");
+        if lcu::lcu_post(&complete_path).await.is_ok() {
+            return Ok(());
+        }
+    }
+
     lcu::lcu_patch(
-        &format!("/lol-champ-select/v1/session/actions/{action_id}"),
-        json!({ "championId": champion_id, "completed": true }),
+        "/lol-champ-select/v1/session/my-selection",
+        json!({ "championId": champion_id }),
     )
     .await?;
     Ok(())
 }
 
 fn trade_path(kind: &str, trade_id: i64, action: &str) -> String {
-    if kind == "champion-swap" {
-        format!("/lol-champ-select/v1/session/champion-swaps/{trade_id}/{action}")
-    } else {
-        format!("/lol-champ-select/v1/session/trades/{trade_id}/{action}")
-    }
+    let segment = match kind {
+        "champion-swap" => "champion-swaps",
+        "position-swap" => "position-swaps",
+        "pick-order-swap" => "pick-order-swaps",
+        _ => "trades",
+    };
+    format!("/lol-champ-select/v1/session/{segment}/{trade_id}/{action}")
 }
 
 #[tauri::command]

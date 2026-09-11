@@ -48,7 +48,7 @@ pub async fn lcu_fetch(endpoint: &str) -> Result<Value, String> {
 }
 
 pub async fn lcu_post(endpoint: &str) -> Result<Value, String> {
-    lcu_request(Method::POST, endpoint, Some(Value::Object(Default::default()))).await
+    lcu_request(Method::POST, endpoint, None).await
 }
 
 pub async fn lcu_patch(endpoint: &str, body: Value) -> Result<Value, String> {
@@ -96,6 +96,27 @@ pub async fn get_gameflow_session() -> Option<Value> {
     lcu_fetch("/lol-gameflow/v1/session").await.ok()
 }
 
+pub async fn get_ready_check() -> Option<Value> {
+    lcu_fetch("/lol-matchmaking/v1/ready-check").await.ok()
+}
+
+pub async fn accept_ready_check() -> Result<(), String> {
+    // Prefer matchmaking accept; fall back to lobby-team-builder (used by some queues).
+    match lcu_post("/lol-matchmaking/v1/ready-check/accept").await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            lcu_post("/lol-lobby-team-builder/v1/ready-check/accept")
+                .await
+                .map(|_| ())
+                .map_err(|_| err)
+        }
+    }
+}
+
 pub async fn get_pickable_champions() -> Option<Value> {
     lcu_fetch("/lol-champ-select/v1/pickable-champions").await.ok()
+}
+
+pub async fn get_subset_champion_list() -> Option<Value> {
+    lcu_fetch("/lol-lobby-team-builder/champ-select/v1/subset-champion-list").await.ok()
 }

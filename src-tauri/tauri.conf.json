@@ -1,6 +1,6 @@
 {
   "productName": "SummTracker",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "identifier": "com.vyriv.summtracker",
   "build": {
     "beforeDevCommand": "npm run vite:dev",

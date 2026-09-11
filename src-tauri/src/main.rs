@@ -2,6 +2,7 @@
 
 mod champ_select;
 mod focus;
+mod hotkey;
 mod lcu;
 mod live_game;
 
@@ -14,9 +15,8 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State};
 use tauri::tray::TrayIconBuilder;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tokio::time::interval;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
@@ -24,8 +24,10 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, EnumChildWindows,
-    GetWindowLongPtrW, SetWindowLongPtrW,
-    GWL_EXSTYLE, GWLP_WNDPROC, MA_NOACTIVATE, WM_MOUSEACTIVATE, WS_EX_NOACTIVATE,
+    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWL_EXSTYLE, GWLP_WNDPROC, HWND_TOPMOST, MA_NOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WM_MOUSEACTIVATE,
+    WS_EX_NOACTIVATE,
 };
 
 static ORIG_WND_PROC: AtomicIsize = AtomicIsize::new(0);
@@ -46,6 +48,10 @@ unsafe extern "system" fn no_activate_wnd_proc(
 
 const COLLAPSED_HEIGHT: u32 = 32;
 const NATURAL_WIDTH: u32 = 320;
+// Layout height at 320px width before scaling (titlebar + allies + bench).
+const CHAMP_SELECT_NATURAL_HEIGHT: f64 = 400.0;
+const CHAMP_SELECT_WIDTH: u32 = 400;
+const CHAMP_SELECT_POLL_MS: u64 = 33;
 const SETTINGS_FILE: &str = "settings.json";
 const BOUNDS_FILE: &str = "bounds.json";
 
@@ -83,9 +89,9 @@ struct AppState {
     expanded_bounds: Mutex<Bounds>,
     natural_height: Mutex<f64>,
     settings_open: Mutex<bool>,
-    current_shortcut: Mutex<Option<String>>,
     latest_game_data: Mutex<Value>,
     in_champ_select: Mutex<bool>,
+    auto_accept_queue: AtomicBool,
 }
 
 fn data_path(app: &AppHandle, file: &str) -> std::path::PathBuf {
@@ -153,7 +159,8 @@ fn scaled_height_for(width: u32, natural_height: f64) -> u32 {
 }
 
 fn champ_select_width(saved_width: u32) -> u32 {
-    saved_width.saturating_add(saved_width * 3 / 4).max(saved_width.saturating_add(160))
+    let base = saved_width.max(NATURAL_WIDTH);
+    CHAMP_SELECT_WIDTH.max(base.saturating_add(80))
 }
 
 fn overlay_size(state: &AppState) -> (u32, u32) {
@@ -167,8 +174,28 @@ fn overlay_size(state: &AppState) -> (u32, u32) {
     }
 }
 
+fn show_without_activate(win: &tauri::WebviewWindow) {
+    if let Ok(hwnd) = win.hwnd() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // Re-assert topmost + visible without activating League away from the client.
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        return;
+    }
+    let _ = win.show();
+}
+
 fn place_champ_select_window(win: &tauri::WebviewWindow, mut width: u32, mut height: u32) {
-    if let Some(monitor) = win
+    let (x, y) = if let Some(monitor) = win
         .current_monitor()
         .ok()
         .flatten()
@@ -177,20 +204,57 @@ fn place_champ_select_window(win: &tauri::WebviewWindow, mut width: u32, mut hei
         let area = monitor.work_area();
         width = width.min(area.size.width.max(1));
         height = height.min(area.size.height.max(1));
-        let x = area.position.x + (area.size.width as i32 - width as i32) / 2;
-        let y = area.position.y + (area.size.height as i32 - height as i32) / 2;
-        let _ = win.set_size(PhysicalSize::new(width, height));
-        let _ = win.set_position(PhysicalPosition::new(x, y));
+        (
+            area.position.x + (area.size.width as i32 - width as i32) / 2,
+            area.position.y + (area.size.height as i32 - height as i32) / 2,
+        )
+    } else {
+        (0, 0)
+    };
+
+    if let Ok(hwnd) = win.hwnd() {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                width as i32,
+                height as i32,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
         return;
     }
+
     let _ = win.set_size(PhysicalSize::new(width, height));
+    if x != 0 || y != 0 {
+        let _ = win.set_position(PhysicalPosition::new(x, y));
+    }
+    let _ = win.show();
 }
 
 fn enter_champ_select_layout(app: &AppHandle, state: &AppState) {
-    if *state.in_champ_select.lock().unwrap() {
+    let entering = {
+        let mut in_champ_select = state.in_champ_select.lock().unwrap();
+        if *in_champ_select {
+            false
+        } else {
+            *in_champ_select = true;
+            true
+        }
+    };
+    if !entering {
         return;
     }
-    *state.in_champ_select.lock().unwrap() = true;
+
+    // Seed a conservative height until the frontend measures real content.
+    {
+        let mut natural = state.natural_height.lock().unwrap();
+        if *natural < 100.0 || *natural > CHAMP_SELECT_NATURAL_HEIGHT * 1.5 {
+            *natural = CHAMP_SELECT_NATURAL_HEIGHT;
+        }
+    }
     if *state.is_collapsed.lock().unwrap() {
         return;
     }
@@ -253,7 +317,14 @@ fn save_settings_to_disk(app: &AppHandle, settings: &Value) {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Value) {
+fn save_settings(app: AppHandle, state: State<Arc<AppState>>, settings: Value) {
+    state.auto_accept_queue.store(
+        settings
+            .get("autoAcceptQueue")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Ordering::Relaxed,
+    );
     save_settings_to_disk(&app, &settings);
 }
 
@@ -280,21 +351,34 @@ fn get_latest_game_data(state: State<Arc<AppState>>) -> Value {
     snapshot
 }
 
-#[tauri::command]
-fn toggle_collapse(app: AppHandle, state: State<Arc<AppState>>) {
-    let win = app.get_webview_window("main").unwrap();
+fn perform_toggle_collapse(app: &AppHandle, state: &AppState) {
+    let Some(win) = app.get_webview_window("main") else { return };
 
-    let (is_collapsed, width, height) = {
+    let is_collapsed = {
         let mut collapsed = state.is_collapsed.lock().unwrap();
         *collapsed = !*collapsed;
-        let is_collapsed = *collapsed;
-        let (width, height) = overlay_size(&state);
-        (is_collapsed, width, height)
+        *collapsed
     };
 
     if is_collapsed {
-        let _ = win.set_size(PhysicalSize::new(width, COLLAPSED_HEIGHT));
+        if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
+            if !*state.in_champ_select.lock().unwrap() {
+                let bounds = Bounds { x: pos.x, y: pos.y, width: size.width, height: size.height };
+                *state.expanded_bounds.lock().unwrap() = bounds.clone();
+                save_bounds_to_disk(app, &bounds);
+            } else {
+                let mut saved = state.expanded_bounds.lock().unwrap();
+                saved.x = pos.x;
+                saved.y = pos.y;
+                save_bounds_to_disk(app, &saved);
+            }
+            let _ = win.set_size(PhysicalSize::new(size.width, COLLAPSED_HEIGHT));
+        } else {
+            let (width, _) = overlay_size(state);
+            let _ = win.set_size(PhysicalSize::new(width, COLLAPSED_HEIGHT));
+        }
     } else {
+        let (width, height) = overlay_size(state);
         let _ = win.set_size(PhysicalSize::new(width, height));
     }
 
@@ -302,8 +386,21 @@ fn toggle_collapse(app: AppHandle, state: State<Arc<AppState>>) {
 }
 
 #[tauri::command]
-fn set_focusable(app: AppHandle, state: State<Arc<AppState>>, focusable: bool) {
+fn toggle_collapse(app: AppHandle, state: State<Arc<AppState>>) {
+    perform_toggle_collapse(&app, state.as_ref());
+}
+
+#[tauri::command]
+fn set_focusable(
+    app: AppHandle,
+    state: State<Arc<AppState>>,
+    focusable: bool,
+    steal_focus: Option<bool>,
+) {
+    let was_focusable = *state.settings_open.lock().unwrap();
     *state.settings_open.lock().unwrap() = focusable;
+    // Collapse bind stays enabled during champ select; only mute it while settings are open.
+    hotkey::set_settings_open(steal_focus.unwrap_or(false));
     let win = app.get_webview_window("main").unwrap();
     if let Ok(hwnd) = win.hwnd() {
         if !focusable && ORIG_WND_PROC.load(Ordering::Relaxed) == 0 {
@@ -311,7 +408,8 @@ fn set_focusable(app: AppHandle, state: State<Arc<AppState>>, focusable: bool) {
         }
         apply_no_activate(hwnd, !focusable);
     }
-    if focusable {
+    // Champ select polls every 250ms. Only steal focus when requested (settings) or first open.
+    if focusable && steal_focus.unwrap_or(!was_focusable) {
         let _ = win.set_focus();
     }
 }
@@ -330,6 +428,12 @@ unsafe extern "system" fn set_child_no_activate(child: HWND, _: LPARAM) -> BOOL 
     BOOL(1)
 }
 
+unsafe extern "system" fn clear_child_no_activate(child: HWND, _: LPARAM) -> BOOL {
+    let ex = GetWindowLongPtrW(child, GWL_EXSTYLE);
+    SetWindowLongPtrW(child, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE.0 as isize));
+    BOOL(1)
+}
+
 fn apply_no_activate(hwnd: HWND, no_activate: bool) {
     unsafe {
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -339,13 +443,19 @@ fn apply_no_activate(hwnd: HWND, no_activate: bool) {
             ex_style & !(WS_EX_NOACTIVATE.0 as isize)
         };
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-        EnumChildWindows(Some(hwnd), Some(set_child_no_activate), LPARAM(0));
+        let child_proc: unsafe extern "system" fn(HWND, LPARAM) -> BOOL = if no_activate {
+            set_child_no_activate
+        } else {
+            clear_child_no_activate
+        };
+        let _ = EnumChildWindows(Some(hwnd), Some(child_proc), LPARAM(0));
     }
 }
 
 #[tauri::command]
 fn set_natural_height(app: AppHandle, state: State<Arc<AppState>>, height: f64) {
     if *state.is_collapsed.lock().unwrap() { return; }
+    if height <= 0.0 { return; }
     *state.natural_height.lock().unwrap() = height;
 
     let win = app.get_webview_window("main").unwrap();
@@ -381,107 +491,15 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-fn apply_collapse_bind(app: &AppHandle, state: &Arc<AppState>, bind: Option<Value>) {
-    let mut current = state.current_shortcut.lock().unwrap();
-
-    if let Some(ref accel) = *current {
-        let _ = app.global_shortcut().unregister(accel.as_str());
-        debug_log(&format!("unregistered collapse bind: {}", accel));
-        *current = None;
-    }
-
-    let Some(bind) = bind else { return };
-    let Some(accel) = bind_to_accelerator(&bind) else { return };
-    debug_log(&format!("registering collapse bind: {}", accel));
-
-    let app_clone = app.clone();
-    let state_clone = Arc::clone(state);
-    let accel_clone = accel.clone();
-
-    let result = app.global_shortcut().on_shortcut(accel.as_str(), move |_app, _shortcut, event| {
-        if event.state == ShortcutState::Pressed {
-            let win = app_clone.get_webview_window("main").unwrap();
-            let is_collapsed = {
-                let mut collapsed = state_clone.is_collapsed.lock().unwrap();
-                *collapsed = !*collapsed;
-                *collapsed
-            };
-
-            if is_collapsed {
-                if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
-                    if !*state_clone.in_champ_select.lock().unwrap() {
-                        let bounds = Bounds { x: pos.x, y: pos.y, width: size.width, height: size.height };
-                        *state_clone.expanded_bounds.lock().unwrap() = bounds.clone();
-                        save_bounds_to_disk(&app_clone, &bounds);
-                    } else {
-                        let mut saved = state_clone.expanded_bounds.lock().unwrap();
-                        saved.x = pos.x;
-                        saved.y = pos.y;
-                        save_bounds_to_disk(&app_clone, &saved);
-                    }
-                    let _ = win.set_size(PhysicalSize::new(size.width, COLLAPSED_HEIGHT));
-                } else {
-                    let (width, _) = overlay_size(&state_clone);
-                    let _ = win.set_size(PhysicalSize::new(width, COLLAPSED_HEIGHT));
-                }
-            } else {
-                let (width, height) = overlay_size(&state_clone);
-                let _ = win.set_size(PhysicalSize::new(width, height));
-            }
-
-            let _ = app_clone.emit("sync-collapse", is_collapsed);
-        }
-    });
-
-    match result {
-        Ok(()) => {
-            debug_log(&format!("registered collapse bind: {}", accel_clone));
-            *current = Some(accel_clone);
-        }
-        Err(err) => {
-            debug_log(&format!("failed to register collapse bind {}: {}", accel, err));
-        }
-    }
+fn apply_collapse_bind(bind: Option<Value>) {
+    let parsed = bind.as_ref().and_then(hotkey::bind_from_json);
+    debug_log(&format!("collapse bind {:?}", parsed));
+    hotkey::set_bind(parsed);
 }
 
 #[tauri::command]
-fn update_collapse_bind(app: AppHandle, state: State<Arc<AppState>>, bind: Option<Value>) {
-    let state = state.inner().clone();
-    apply_collapse_bind(&app, &state, bind);
-}
-
-fn bind_to_accelerator(bind: &Value) -> Option<String> {
-    let key = bind["key"].as_str()?.to_lowercase();
-    let mapped = match key.as_str() {
-        " "           => "Space",
-        "tab"         => "Tab",
-        "escape"      => "Escape",
-        "esc"         => "Escape",
-        "backspace"   => "Backspace",
-        "delete"      => "Delete",
-        "insert"      => "Insert",
-        "home"        => "Home",
-        "end"         => "End",
-        "pageup"      => "PageUp",
-        "pagedown"    => "PageDown",
-        "capslock"    => "CapsLock",
-        "arrowleft"   => "Left",
-        "arrowright"  => "Right",
-        "arrowup"     => "Up",
-        "arrowdown"   => "Down",
-        "enter"       => "Return",
-        other         => return Some(build_accelerator(bind, other.to_uppercase().as_str())),
-    };
-    Some(build_accelerator(bind, mapped))
-}
-
-fn build_accelerator(bind: &Value, key: &str) -> String {
-    let mut parts = Vec::new();
-    if bind["ctrl"].as_bool().unwrap_or(false)  { parts.push("Control"); }
-    if bind["alt"].as_bool().unwrap_or(false)   { parts.push("Alt"); }
-    if bind["shift"].as_bool().unwrap_or(false) { parts.push("Shift"); }
-    parts.push(key);
-    parts.join("+")
+fn update_collapse_bind(bind: Option<Value>) {
+    apply_collapse_bind(bind);
 }
 
 // ── Game state helpers ──
@@ -661,27 +679,98 @@ fn compute_room_id(players: &[Value], own_team: &str) -> Option<String> {
     Some(hex::encode(&hash[..12])) // 24 hex chars
 }
 
+fn gameflow_phase(gameflow: Option<&Value>) -> &str {
+    gameflow
+        .and_then(|g| g.get("phase").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn ready_check_in_progress(ready: Option<&Value>) -> bool {
+    ready
+        .and_then(|r| r.get("state").and_then(Value::as_str))
+        .map(|s| s.eq_ignore_ascii_case("InProgress"))
+        .unwrap_or(false)
+}
+
+fn ready_check_already_accepted(ready: Option<&Value>) -> bool {
+    ready
+        .and_then(|r| r.get("playerResponse").and_then(Value::as_str))
+        .map(|s| s.eq_ignore_ascii_case("Accepted"))
+        .unwrap_or(false)
+}
+
+async fn try_auto_accept_ready_check(state: &AppState, phase: &str) -> bool {
+    if !state.auto_accept_queue.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let ready = lcu::get_ready_check().await;
+    let in_progress = ready_check_in_progress(ready.as_ref())
+        || phase.eq_ignore_ascii_case("ReadyCheck");
+    if !in_progress {
+        return false;
+    }
+    if ready_check_already_accepted(ready.as_ref()) {
+        return true;
+    }
+
+    match lcu::accept_ready_check().await {
+        Ok(()) => {
+            debug_log("automatically accepted ready check");
+            true
+        }
+        Err(err) => {
+            // Always log accept failures so release builds are diagnosable.
+            eprintln!("[summtracker] auto accept ready check failed: {err}");
+            false
+        }
+    }
+}
+
 // ── Game polling loop ──
 
 async fn game_loop(app: AppHandle, state: Arc<AppState>) {
-    let mut delay = Duration::from_secs(3);
+    let mut delay = Duration::from_millis(400);
 
     loop {
         tokio::time::sleep(delay).await;
 
-        let game_running = live_game::is_game_running().await;
+        let lcu_running = lcu::is_client_running();
+        let (live_up, gameflow_quick) = tokio::join!(
+            live_game::is_game_running(),
+            async {
+                if lcu_running {
+                    lcu::get_gameflow_session().await
+                } else {
+                    None
+                }
+            },
+        );
+        // Live client can still answer briefly while the client is in champ select.
+        // Prefer LCU phase so ARAM select is never skipped.
+        let phase = gameflow_phase(gameflow_quick.as_ref()).to_string();
+        let queue_hot = lcu_running
+            && (phase.eq_ignore_ascii_case("ReadyCheck")
+                || phase.eq_ignore_ascii_case("Matchmaking"));
+        if lcu_running {
+            let _ = try_auto_accept_ready_check(&state, &phase).await;
+        }
+        let in_client_champ_select = phase.eq_ignore_ascii_case("ChampSelect");
+        let game_running = live_up && !in_client_champ_select;
         let current_state = state.game_state.lock().unwrap().clone();
         debug_log(&format!(
-            "poll tick: current_state={:?} live_game_running={} lcu_running={}",
+            "poll tick: current_state={:?} live_game_running={} phase={} lcu_running={} auto_accept={}",
             current_state,
             game_running,
-            lcu::is_client_running(),
+            phase,
+            lcu_running,
+            state.auto_accept_queue.load(Ordering::Relaxed),
         ));
 
         if game_running && current_state != GameState::InGame {
             let (players_res, gameflow_res, live_res) = tokio::join!(
                 live_game::get_all_players(),
-                lcu::get_gameflow_session(),
+                async { gameflow_quick.clone() },
                 live_game::get_all_game_data(),
             );
 
@@ -785,7 +874,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
         }
 
         if !game_running && current_state != GameState::InGame {
-            if !lcu::is_client_running() {
+            if !lcu_running {
                 if current_state != GameState::Idle {
                     debug_log("league client not running -> idle");
                     restore_saved_layout(&app, &state);
@@ -801,9 +890,10 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
 
             let session = lcu::get_champ_select_session().await;
             debug_log(&format!(
-                "champ-select probe: found_session={} current_state={:?}",
+                "champ-select probe: found_session={} current_state={:?} phase={}",
                 session.is_some(),
                 current_state,
+                phase,
             ));
             match (session, current_state) {
                 (Some(s), GameState::Idle) | (Some(s), GameState::ChampSelect) => {
@@ -817,23 +907,29 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                             let _ = win.hide();
                             let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
                         }
-                        delay = Duration::from_millis(500);
+                        delay = Duration::from_millis(400);
                         continue;
                     }
 
-                    let (gameflow, pickable) = tokio::join!(
-                        lcu::get_gameflow_session(),
+                    let (gameflow, pickable, subset) = tokio::join!(
+                        async { gameflow_quick.clone() },
                         lcu::get_pickable_champions(),
+                        lcu::get_subset_champion_list(),
                     );
-                    let payload = champ_select::build_payload(&s, gameflow.as_ref(), pickable.as_ref());
+                    let payload = champ_select::build_payload(
+                        &s,
+                        gameflow.as_ref(),
+                        pickable.as_ref(),
+                        subset.as_ref(),
+                    );
                     debug_log("entering/staying ARAM champ select");
                     enter_champ_select_layout(&app, &state);
                     *state.game_state.lock().unwrap() = GameState::ChampSelect;
                     *state.latest_game_data.lock().unwrap() = payload.clone();
                     let win = app.get_webview_window("main").unwrap();
-                    let _ = win.show();
+                    show_without_activate(&win);
                     let _ = app.emit("game-data", payload);
-                    delay = Duration::from_millis(250);
+                    delay = Duration::from_millis(CHAMP_SELECT_POLL_MS);
                     continue;
                 }
                 (None, GameState::ChampSelect) => {
@@ -850,11 +946,13 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
         }
 
         delay = match *state.game_state.lock().unwrap() {
-            GameState::ChampSelect => Duration::from_millis(250),
+            GameState::ChampSelect => Duration::from_millis(CHAMP_SELECT_POLL_MS),
             GameState::InGame => Duration::from_secs(3),
             GameState::Idle => {
-                if lcu::is_client_running() {
-                    Duration::from_millis(500)
+                if queue_hot && state.auto_accept_queue.load(Ordering::Relaxed) {
+                    Duration::from_millis(100)
+                } else if lcu_running {
+                    Duration::from_millis(400)
                 } else {
                     Duration::from_secs(3)
                 }
@@ -1017,7 +1115,6 @@ pub fn run() {
     }
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
@@ -1037,19 +1134,35 @@ pub fn run() {
                 expanded_bounds: Mutex::new(bounds.clone()),
                 natural_height: Mutex::new(initial_natural_height),
                 settings_open: Mutex::new(false),
-                current_shortcut: Mutex::new(None),
                 latest_game_data: Mutex::new(serde_json::json!({ "state": "idle" })),
                 in_champ_select: Mutex::new(false),
+                auto_accept_queue: AtomicBool::new(false),
             });
 
             app.manage(state.clone());
             let saved_settings = load_settings(app.handle().clone());
+            state.auto_accept_queue.store(
+                saved_settings
+                    .get("autoAcceptQueue")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                Ordering::Relaxed,
+            );
             debug_log(&format!(
                 "startup collapseBind={}",
                 saved_settings.get("collapseBind").cloned().unwrap_or(Value::Null)
             ));
-            apply_collapse_bind(&app.handle(), &state, saved_settings.get("collapseBind").cloned());
+            apply_collapse_bind(saved_settings.get("collapseBind").cloned());
             ensure_default_autostart(&app.handle());
+
+            {
+                let app = app.handle().clone();
+                hotkey::set_on_toggle(move || {
+                    let state = app.state::<Arc<AppState>>();
+                    perform_toggle_collapse(&app, state.as_ref());
+                });
+            }
+            hotkey::install();
 
             // Position window from saved bounds and apply no-activate so overlay never steals focus
             if let Some(win) = app.get_webview_window("main") {
@@ -1099,14 +1212,14 @@ pub fn run() {
                     let in_champ_select = *state_clone.in_champ_select.lock().unwrap();
                     match event {
                         tauri::WindowEvent::Resized(size) => {
+                            if in_champ_select {
+                                return;
+                            }
+
                             let natural_height = *state_clone.natural_height.lock().unwrap();
                             let target_height = scaled_height_for(size.width, natural_height);
                             if size.height != target_height {
                                 let _ = win.set_size(PhysicalSize::new(size.width, target_height));
-                                return;
-                            }
-
-                            if in_champ_select {
                                 return;
                             }
 

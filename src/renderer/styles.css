@@ -118,9 +118,12 @@ body.collapsed #titlebar {
   overflow: hidden;
 }
 
+body.champ-select-active #content {
+  -webkit-app-region: no-drag;
+}
+
 #champ-select-screen {
-  overflow-y: auto;
-  max-height: calc(100vh - 40px);
+  overflow: hidden;
 }
 
 body.collapsed #content {
@@ -432,6 +435,7 @@ body.hide-own-team .own-team { display: none; }
 
 .cs-status.error { color: #ff6b6b; }
 .cs-status.ok { color: #6ecf8e; }
+.cs-status.queued { color: #c8aa5a; }
 
 .bench-grid {
   display: flex;
@@ -461,6 +465,13 @@ body.hide-own-team .own-team { display: none; }
 }
 .champ-tile:hover { border-color: #c8aa5a; }
 .champ-tile.local { border-color: rgba(74, 158, 255, 0.8); cursor: default; }
+.champ-tile.queued { border-color: #c8aa5a; box-shadow: 0 0 7px rgba(200, 170, 90, 0.55); }
+.champ-tile.locked {
+  opacity: 0.72;
+}
+.champ-tile.queued.locked {
+  opacity: 0.9;
+}
 .champ-tile.disabled {
   opacity: 0.4;
   cursor: default;

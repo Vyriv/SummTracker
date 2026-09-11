@@ -19,6 +19,7 @@ const DEFAULT_SETTINGS = {
   format: 'mm:ss',
   opacity: 90,
   collapseBind: null,
+  autoAcceptQueue: false,
 };
 
 let settings = { ...DEFAULT_SETTINGS };
@@ -39,6 +40,7 @@ function applySettings() {
   document.getElementById('s-own-team').checked = settings.showOwnTeam;
   document.getElementById('s-champ-name').checked = settings.showChampName;
   document.getElementById('s-summoner-name').checked = settings.showSummonerName;
+  document.getElementById('s-auto-accept').checked = settings.autoAcceptQueue;
   document.querySelectorAll('.fmt-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.fmt === settings.format);
   });
@@ -92,6 +94,11 @@ function initSettingsPanel() {
     settings.showSummonerName = e.target.checked;
     saveSettings();
     applySettings();
+  });
+
+  document.getElementById('s-auto-accept').addEventListener('change', e => {
+    settings.autoAcceptQueue = e.target.checked;
+    saveSettings();
   });
 
   document.querySelectorAll('.fmt-btn').forEach(btn => {
@@ -158,14 +165,6 @@ function initSettingsPanel() {
   }, true);
 }
 
-function isBindMatch(event, bind) {
-  if (!bind || !bind.key) return false;
-  return event.key.toLowerCase() === bind.key.toLowerCase()
-    && Boolean(event.shiftKey) === Boolean(bind.shift)
-    && Boolean(event.ctrlKey) === Boolean(bind.ctrl)
-    && Boolean(event.altKey) === Boolean(bind.alt);
-}
-
 let settingsOpen = false;
 
 function toggleSettings() {
@@ -176,7 +175,10 @@ function toggleSettings() {
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'idle-screen');
   document.getElementById('champ-select-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'champ-select-screen');
 
-  invoke('set_focusable', { focusable: settingsOpen || currentScreen === 'champ-select-screen' });
+  invoke('set_focusable', {
+    focusable: settingsOpen || currentScreen === 'champ-select-screen',
+    stealFocus: settingsOpen,
+  });
   syncGameHeight();
 }
 
@@ -608,6 +610,12 @@ function setChampSelectStatus(message, kind = '') {
 let champSelectBusy = false;
 let lastChampSelect = null;
 let lastChampSelectKey = '';
+let queuedBenchSwap = null;
+let queuedBenchSwapInFlight = false;
+let queuedBenchSwapTimer = null;
+let queuedBenchMissingTicks = 0;
+const QUEUED_SWAP_RETRY_MS = 50;
+const QUEUED_SWAP_MISSING_GRACE = 8;
 
 function makeChampTile(championId, title, className = '') {
   const btn = document.createElement('button');
@@ -628,32 +636,147 @@ async function clickChampSelectChampion(championId) {
   const session = lastChampSelect;
   champSelectBusy = true;
   try {
-    if (session?.pickActionId != null && !session.myChampionId) {
-      await invoke('complete_pick', { actionId: session.pickActionId, championId });
-      setChampSelectStatus(`Picked ${champName(championId)}`, 'ok');
-    } else {
-      await invoke('swap_bench', { championId });
-      setChampSelectStatus(`Swapped to ${champName(championId)}`, 'ok');
-    }
+    await invoke('complete_pick', { actionId: session?.pickActionId ?? -1, championId });
+    setChampSelectStatus(`Picked ${champName(championId)}`, 'ok');
   } catch (err) {
-    setChampSelectStatus(String(err).replace(/^LCU \d+ [^:]+:\s*/, '') || 'Swap failed', 'error');
+    setChampSelectStatus(String(err).replace(/^LCU \d+ [^:]+:\s*/, '') || 'Action failed', 'error');
   } finally {
     champSelectBusy = false;
   }
 }
 
+function markQueuedBenchTile(championId) {
+  document.querySelectorAll('.champ-tile.queued').forEach(tile => {
+    tile.classList.remove('queued', 'locked');
+  });
+  if (!championId) return;
+  const tile = document.querySelector(`#cs-bench .champ-tile[data-champion-id="${championId}"]`);
+  if (tile) {
+    tile.classList.add('queued', 'locked');
+    tile.title = `Queued ${champName(championId)} (swaps when unlocked)`;
+  }
+}
+
+function clearQueuedBenchSwap() {
+  queuedBenchSwap = null;
+  queuedBenchMissingTicks = 0;
+  if (queuedBenchSwapTimer != null) {
+    clearTimeout(queuedBenchSwapTimer);
+    queuedBenchSwapTimer = null;
+  }
+  document.querySelectorAll('.champ-tile.queued').forEach(tile => {
+    tile.classList.remove('queued', 'locked');
+  });
+}
+
+function scheduleQueuedBenchSwap() {
+  if (!queuedBenchSwap || queuedBenchSwapTimer != null) return;
+  queuedBenchSwapTimer = setTimeout(() => {
+    queuedBenchSwapTimer = null;
+    attemptQueuedBenchSwap();
+  }, QUEUED_SWAP_RETRY_MS);
+}
+
+async function attemptQueuedBenchSwap() {
+  const queued = queuedBenchSwap;
+  if (!queued || queuedBenchSwapInFlight || champSelectBusy) {
+    scheduleQueuedBenchSwap();
+    return;
+  }
+
+  const session = lastChampSelect;
+  if (!session || session.state !== 'champ-select') {
+    clearQueuedBenchSwap();
+    return;
+  }
+  if (session.myChampionId === queued.championId) {
+    clearQueuedBenchSwap();
+    setChampSelectStatus(`Swapped to ${champName(queued.championId)}`, 'ok');
+    return;
+  }
+
+  // Swap already accepted by LCU; wait for session to catch up without re-swapping.
+  if (queued.awaitingConfirm) {
+    const bench = Array.isArray(session.bench) ? session.bench : [];
+    if (bench.includes(queued.championId)) {
+      // Still on the bench means the accept did not stick; try again.
+      queued.awaitingConfirm = false;
+      queued.confirmTicks = 0;
+    } else {
+      queued.confirmTicks = (queued.confirmTicks || 0) + 1;
+      if (queued.confirmTicks > 40) {
+        queued.awaitingConfirm = false;
+        queued.confirmTicks = 0;
+      } else {
+        setChampSelectStatus(`Swapping to ${champName(queued.championId)}...`, 'queued');
+        scheduleQueuedBenchSwap();
+        return;
+      }
+    }
+  }
+
+  const bench = Array.isArray(session.bench) ? session.bench : [];
+  if (!bench.includes(queued.championId)) {
+    queuedBenchMissingTicks += 1;
+    if (queuedBenchMissingTicks >= QUEUED_SWAP_MISSING_GRACE) {
+      clearQueuedBenchSwap();
+      setChampSelectStatus(`${champName(queued.championId)} left the bench`, 'error');
+      return;
+    }
+    setChampSelectStatus(`Queued ${champName(queued.championId)} (waiting to unlock)`, 'queued');
+    scheduleQueuedBenchSwap();
+    return;
+  }
+  queuedBenchMissingTicks = 0;
+
+  queuedBenchSwapInFlight = true;
+  try {
+    await invoke('swap_bench', { championId: queued.championId });
+    if (queuedBenchSwap === queued) {
+      queued.awaitingConfirm = true;
+      setChampSelectStatus(`Swapping to ${champName(queued.championId)}...`, 'queued');
+      scheduleQueuedBenchSwap();
+    }
+  } catch (_) {
+    if (queuedBenchSwap === queued) {
+      queued.awaitingConfirm = false;
+      markQueuedBenchTile(queued.championId);
+      setChampSelectStatus(`Queued ${champName(queued.championId)} (waiting to unlock)`, 'queued');
+      scheduleQueuedBenchSwap();
+    }
+  } finally {
+    queuedBenchSwapInFlight = false;
+  }
+}
+
+function queueBenchSwap(championId) {
+  if (!championId) return;
+  if (queuedBenchSwap?.championId === championId) {
+    clearQueuedBenchSwap();
+    setChampSelectStatus('Queue cleared', '');
+    return;
+  }
+  queuedBenchSwap = { championId, awaitingConfirm: false, confirmTicks: 0 };
+  queuedBenchMissingTicks = 0;
+  markQueuedBenchTile(championId);
+  setChampSelectStatus(`Queued ${champName(championId)} (waiting to unlock)`, 'queued');
+  attemptQueuedBenchSwap();
+}
+
 async function clickAllyTrade(ally) {
-  if (champSelectBusy || ally?.tradeId == null) return;
-  const state = String(ally.tradeState || '').toUpperCase();
-  const kind = ally.tradeKind || 'trade';
+  if (champSelectBusy) return;
+  const latest = lastChampSelect?.allies?.find(a => a.cellId === ally.cellId) || ally;
+  if (latest?.tradeId == null) return;
+  const state = String(latest.tradeState || '').toUpperCase();
+  const kind = latest.tradeKind || 'trade';
   champSelectBusy = true;
   try {
     if (state === 'RECEIVED') {
-      await invoke('accept_trade', { tradeId: ally.tradeId, kind });
-      setChampSelectStatus(`Accepted trade for ${champName(ally.championId)}`, 'ok');
+      await invoke('accept_trade', { tradeId: latest.tradeId, kind });
+      setChampSelectStatus(`Accepted trade for ${champName(latest.championId)}`, 'ok');
     } else if (state === 'AVAILABLE') {
-      await invoke('request_trade', { tradeId: ally.tradeId, kind });
-      setChampSelectStatus(`Trade requested for ${champName(ally.championId)}`, 'ok');
+      await invoke('request_trade', { tradeId: latest.tradeId, kind });
+      setChampSelectStatus(`Trade requested for ${champName(latest.championId)}`, 'ok');
     }
   } catch (err) {
     setChampSelectStatus(String(err).replace(/^LCU \d+ [^:]+:\s*/, '') || 'Trade failed', 'error');
@@ -707,7 +830,9 @@ function renderChampSelect(data) {
   const cardsWrap = document.getElementById('cs-cards-wrap');
   const cardsEl = document.getElementById('cs-cards');
   cardsEl.innerHTML = '';
-  const showCards = cards.length > 0 && !myId;
+  const phase = String(data.phase || '').toUpperCase();
+  const needsPick = data.pickActionId != null || phase.includes('CARD') || phase.includes('PICK');
+  const showCards = cards.length > 0 && needsPick && !myId;
   cardsWrap.classList.toggle('hidden', !showCards);
   if (showCards) {
     cards.forEach(id => {
@@ -774,8 +899,13 @@ function renderChampSelect(data) {
   benchEl.innerHTML = '';
   benchWrap.classList.toggle('hidden', bench.length === 0);
   bench.forEach(id => {
-    const tile = makeChampTile(id, `Swap to ${champName(id)}`);
-    tile.addEventListener('click', () => clickChampSelectChampion(id));
+    const isQueued = queuedBenchSwap?.championId === id;
+    const classes = [isQueued ? 'queued' : '', isQueued ? 'locked' : ''].filter(Boolean).join(' ');
+    const title = isQueued
+      ? `Queued ${champName(id)} (swaps when unlocked)`
+      : `Swap to ${champName(id)} (queues if locked)`;
+    const tile = makeChampTile(id, title, classes);
+    tile.addEventListener('click', () => queueBenchSwap(id));
     benchEl.appendChild(tile);
   });
 }
@@ -803,12 +933,13 @@ function flushPendingSyncEvents() {
 
 function handleGameData(data) {
   if (data.state === 'in-game' && data.players) {
+    clearQueuedBenchSwap();
     ownTeam = data.ownTeam || null;
     const enriched = data.players.map(enrichPlayer);
     renderPlayers(enriched);
     document.getElementById('titlebar-label').textContent = 'SummTracker';
     showScreen('game-screen');
-    if (!settingsOpen) invoke('set_focusable', { focusable: false });
+    if (!settingsOpen) invoke('set_focusable', { focusable: false, stealFocus: false });
     syncGameHeight();
     syncToRoom(data.roomId || null);
   } else if (data.state === 'champ-select' && data.benchEnabled) {
@@ -817,11 +948,16 @@ function handleGameData(data) {
     pendingSyncEvents = [];
     syncToRoom(null);
     renderChampSelect(data);
+    if (queuedBenchSwap) attemptQueuedBenchSwap();
     document.getElementById('titlebar-label').textContent = data.mode || 'ARAM';
     showScreen('champ-select-screen');
-    invoke('set_focusable', { focusable: true });
+    document.body.classList.add('champ-select-active');
+    // Interactive for trades, cards, and bench clicks without stealing League focus each poll.
+    invoke('set_focusable', { focusable: true, stealFocus: false });
     syncGameHeight();
   } else {
+    clearQueuedBenchSwap();
+    document.body.classList.remove('champ-select-active');
     resetAllCooldowns();
     enemyPlayerIndices = [];
     pendingSyncEvents = [];
@@ -830,7 +966,7 @@ function handleGameData(data) {
     showScreen('idle-screen');
     lastChampSelect = null;
     lastChampSelectKey = '';
-    if (!settingsOpen) invoke('set_focusable', { focusable: false });
+    if (!settingsOpen) invoke('set_focusable', { focusable: false, stealFocus: false });
   }
 }
 
@@ -846,17 +982,11 @@ document.getElementById('close-btn').addEventListener('click', () => {
   invoke('quit_app');
 });
 
-window.addEventListener('keydown', (event) => {
-  if (settingsOpen) return;
-  if (!isBindMatch(event, settings.collapseBind)) return;
-  event.preventDefault();
-  invoke('toggle_collapse');
-}, true);
-
 // ── Tauri event listeners ──
 
 listen('sync-collapse', (event) => {
   document.body.classList.toggle('collapsed', event.payload);
+  if (!event.payload) syncGameHeight();
 });
 
 listen('game-data', (event) => {
@@ -906,7 +1036,7 @@ invoke('load_settings').then(saved => {
   initSettingsPanel();
   applySettings();
   invoke('update_collapse_bind', { bind: settings.collapseBind });
-  invoke('set_focusable', { focusable: false });
+  invoke('set_focusable', { focusable: false, stealFocus: false });
   invoke('get_latest_game_data').then(handleGameData).catch(() => {});
 });
 
