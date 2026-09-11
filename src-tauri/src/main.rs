@@ -16,7 +16,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri_plugin_autostart::ManagerExt;
 use tokio::time::interval;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering};
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
@@ -51,7 +51,8 @@ const NATURAL_WIDTH: u32 = 320;
 // Layout height at 320px width before scaling (titlebar + allies + bench).
 const CHAMP_SELECT_NATURAL_HEIGHT: f64 = 400.0;
 const CHAMP_SELECT_WIDTH: u32 = 400;
-const CHAMP_SELECT_POLL_MS: u64 = 33;
+const CHAMP_SELECT_POLL_MS: u64 = 16;
+const PENDING_SWAP_POLL_MS: u64 = 8;
 const SETTINGS_FILE: &str = "settings.json";
 const BOUNDS_FILE: &str = "bounds.json";
 
@@ -92,6 +93,8 @@ struct AppState {
     latest_game_data: Mutex<Value>,
     in_champ_select: Mutex<bool>,
     auto_accept_queue: AtomicBool,
+    /// Champion id to steal as soon as it unlocks. `0` means none.
+    pending_bench_swap: AtomicI64,
 }
 
 fn data_path(app: &AppHandle, file: &str) -> std::path::PathBuf {
@@ -232,6 +235,45 @@ fn place_champ_select_window(win: &tauri::WebviewWindow, mut width: u32, mut hei
         let _ = win.set_position(PhysicalPosition::new(x, y));
     }
     let _ = win.show();
+}
+
+/// Resize the champ-select overlay without moving it. Used for content height updates.
+fn resize_champ_select_window(win: &tauri::WebviewWindow, width: u32, height: u32) {
+    let (width, height) = if let Some(monitor) = win
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| win.primary_monitor().ok().flatten())
+    {
+        let area = monitor.work_area();
+        (
+            width.min(area.size.width.max(1)),
+            height.min(area.size.height.max(1)),
+        )
+    } else {
+        (width, height)
+    };
+
+    if let Ok(hwnd) = win.hwnd() {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                width as i32,
+                height as i32,
+                SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        return;
+    }
+
+    let _ = win.set_size(PhysicalSize::new(width, height));
+}
+
+fn height_needs_update(current: u32, target: u32) -> bool {
+    (current as i32 - target as i32).unsigned_abs() > 1
 }
 
 fn enter_champ_select_layout(app: &AppHandle, state: &AppState) {
@@ -456,6 +498,12 @@ fn apply_no_activate(hwnd: HWND, no_activate: bool) {
 fn set_natural_height(app: AppHandle, state: State<Arc<AppState>>, height: f64) {
     if *state.is_collapsed.lock().unwrap() { return; }
     if height <= 0.0 { return; }
+
+    let previous_natural = *state.natural_height.lock().unwrap();
+    // Ignore tiny measurement jitter that would otherwise thrash the window size.
+    if (previous_natural - height).abs() < 0.5 {
+        return;
+    }
     *state.natural_height.lock().unwrap() = height;
 
     let win = app.get_webview_window("main").unwrap();
@@ -464,13 +512,14 @@ fn set_natural_height(app: AppHandle, state: State<Arc<AppState>>, height: f64) 
     let h = scaled_height_for(w, height);
 
     if *state.in_champ_select.lock().unwrap() {
-        if size.height != h {
-            place_champ_select_window(&win, w, h);
+        if height_needs_update(size.height, h) {
+            // Keep the user's position. Only the enter path recenters once.
+            resize_champ_select_window(&win, w, h);
         }
         return;
     }
 
-    if size.height != h {
+    if height_needs_update(size.height, h) {
         let _ = win.set_size(PhysicalSize::new(w, h));
     }
 
@@ -500,6 +549,32 @@ fn apply_collapse_bind(bind: Option<Value>) {
 #[tauri::command]
 fn update_collapse_bind(bind: Option<Value>) {
     apply_collapse_bind(bind);
+}
+
+#[tauri::command]
+fn set_pending_bench_swap(state: State<Arc<AppState>>, champion_id: Option<i64>) {
+    let id = champion_id.filter(|id| *id > 0).unwrap_or(0);
+    state.pending_bench_swap.store(id, Ordering::Relaxed);
+    debug_log(&format!("pending bench swap -> {id}"));
+}
+
+fn clear_pending_bench_swap(state: &AppState) {
+    state.pending_bench_swap.store(0, Ordering::Relaxed);
+}
+
+async fn pending_bench_swap_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(PENDING_SWAP_POLL_MS)).await;
+        let champion_id = state.pending_bench_swap.load(Ordering::Relaxed);
+        if champion_id <= 0 {
+            continue;
+        }
+        if *state.game_state.lock().unwrap() != GameState::ChampSelect {
+            continue;
+        }
+        // Hammer the swap endpoint so a queued champ is taken the instant it unlocks.
+        let _ = champ_select::swap_bench_inner(champion_id).await;
+    }
 }
 
 // ── Game state helpers ──
@@ -829,6 +904,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
             debug_log(&format!("own_team='{}' room_id={:?}", own_team, room_id));
 
             restore_saved_layout(&app, &state);
+            clear_pending_bench_swap(&state);
             *state.game_state.lock().unwrap() = GameState::InGame;
             let game_data = serde_json::json!({
                 "state": "in-game",
@@ -922,6 +998,16 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                         pickable.as_ref(),
                         subset.as_ref(),
                     );
+                    let pending = state.pending_bench_swap.load(Ordering::Relaxed);
+                    if pending > 0
+                        && payload
+                            .get("myChampionId")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
+                            == pending
+                    {
+                        clear_pending_bench_swap(&state);
+                    }
                     debug_log("entering/staying ARAM champ select");
                     enter_champ_select_layout(&app, &state);
                     *state.game_state.lock().unwrap() = GameState::ChampSelect;
@@ -934,6 +1020,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                 }
                 (None, GameState::ChampSelect) => {
                     debug_log("champ select ended -> idle");
+                    clear_pending_bench_swap(&state);
                     restore_saved_layout(&app, &state);
                     *state.game_state.lock().unwrap() = GameState::Idle;
                     *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
@@ -1137,6 +1224,7 @@ pub fn run() {
                 latest_game_data: Mutex::new(serde_json::json!({ "state": "idle" })),
                 in_champ_select: Mutex::new(false),
                 auto_accept_queue: AtomicBool::new(false),
+                pending_bench_swap: AtomicI64::new(0),
             });
 
             app.manage(state.clone());
@@ -1257,6 +1345,11 @@ pub fn run() {
                 game_loop(app_handle2, game_loop_state).await;
             });
 
+            let pending_swap_state = Arc::clone(&state);
+            tauri::async_runtime::spawn(async move {
+                pending_bench_swap_loop(pending_swap_state).await;
+            });
+
             let app_handle3 = app.handle().clone();
             let state_clone2 = Arc::clone(&state);
             tauri::async_runtime::spawn(async move {
@@ -1282,6 +1375,7 @@ pub fn run() {
             set_natural_height,
             quit_app,
             update_collapse_bind,
+            set_pending_bench_swap,
             champ_select::swap_bench,
             champ_select::complete_pick,
             champ_select::request_trade,

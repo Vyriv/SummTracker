@@ -191,12 +191,24 @@ function updateScale() {
   document.getElementById('app').style.transform = `scale(${scale})`;
 }
 
-function syncGameHeight() {
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    const app = document.getElementById('app');
-    const h = app.scrollHeight;
-    if (h > 0) invoke('set_natural_height', { height: h });
-  }));
+let lastSyncedHeight = 0;
+let syncHeightTimer = null;
+
+function syncGameHeight(force = false) {
+  if (syncHeightTimer != null) {
+    clearTimeout(syncHeightTimer);
+  }
+  syncHeightTimer = setTimeout(() => {
+    syncHeightTimer = null;
+    requestAnimationFrame(() => {
+      const app = document.getElementById('app');
+      const h = app.scrollHeight;
+      if (h <= 0) return;
+      if (!force && Math.abs(h - lastSyncedHeight) < 1) return;
+      lastSyncedHeight = h;
+      invoke('set_natural_height', { height: h });
+    });
+  }, force ? 0 : 80);
 }
 
 new ResizeObserver(updateScale).observe(document.body);
@@ -614,8 +626,8 @@ let queuedBenchSwap = null;
 let queuedBenchSwapInFlight = false;
 let queuedBenchSwapTimer = null;
 let queuedBenchMissingTicks = 0;
-const QUEUED_SWAP_RETRY_MS = 50;
-const QUEUED_SWAP_MISSING_GRACE = 8;
+const QUEUED_SWAP_RETRY_MS = 16;
+const QUEUED_SWAP_MISSING_GRACE = 12;
 
 function makeChampTile(championId, title, className = '') {
   const btn = document.createElement('button');
@@ -667,6 +679,7 @@ function clearQueuedBenchSwap() {
   document.querySelectorAll('.champ-tile.queued').forEach(tile => {
     tile.classList.remove('queued', 'locked');
   });
+  invoke('set_pending_bench_swap', { championId: null }).catch(() => {});
 }
 
 function scheduleQueuedBenchSwap() {
@@ -760,6 +773,7 @@ function queueBenchSwap(championId) {
   queuedBenchMissingTicks = 0;
   markQueuedBenchTile(championId);
   setChampSelectStatus(`Queued ${champName(championId)} (waiting to unlock)`, 'queued');
+  invoke('set_pending_bench_swap', { championId }).catch(() => {});
   attemptQueuedBenchSwap();
 }
 
@@ -802,7 +816,7 @@ function renderChampSelect(data) {
   const key = champSelectKey(data);
   if (key === lastChampSelectKey) {
     lastChampSelect = data;
-    return;
+    return false;
   }
   lastChampSelectKey = key;
   lastChampSelect = data;
@@ -908,6 +922,7 @@ function renderChampSelect(data) {
     tile.addEventListener('click', () => queueBenchSwap(id));
     benchEl.appendChild(tile);
   });
+  return true;
 }
 
 function applySyncCooldownEvent(event) {
@@ -943,18 +958,19 @@ function handleGameData(data) {
     syncGameHeight();
     syncToRoom(data.roomId || null);
   } else if (data.state === 'champ-select' && data.benchEnabled) {
+    const entering = !document.body.classList.contains('champ-select-active');
     resetAllCooldowns();
     enemyPlayerIndices = [];
     pendingSyncEvents = [];
     syncToRoom(null);
-    renderChampSelect(data);
+    const layoutChanged = renderChampSelect(data);
     if (queuedBenchSwap) attemptQueuedBenchSwap();
     document.getElementById('titlebar-label').textContent = data.mode || 'ARAM';
     showScreen('champ-select-screen');
     document.body.classList.add('champ-select-active');
     // Interactive for trades, cards, and bench clicks without stealing League focus each poll.
     invoke('set_focusable', { focusable: true, stealFocus: false });
-    syncGameHeight();
+    if (entering || layoutChanged) syncGameHeight(entering);
   } else {
     clearQueuedBenchSwap();
     document.body.classList.remove('champ-select-active');
@@ -986,7 +1002,7 @@ document.getElementById('close-btn').addEventListener('click', () => {
 
 listen('sync-collapse', (event) => {
   document.body.classList.toggle('collapsed', event.payload);
-  if (!event.payload) syncGameHeight();
+  if (!event.payload) syncGameHeight(true);
 });
 
 listen('game-data', (event) => {

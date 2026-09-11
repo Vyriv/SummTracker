@@ -286,6 +286,10 @@ pub fn build_payload(
 
 #[tauri::command]
 pub async fn swap_bench(champion_id: i64) -> Result<(), String> {
+    swap_bench_inner(champion_id).await
+}
+
+pub async fn swap_bench_inner(champion_id: i64) -> Result<(), String> {
     if champion_id <= 0 {
         return Err("Invalid champion".to_string());
     }
