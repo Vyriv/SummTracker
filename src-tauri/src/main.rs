@@ -926,6 +926,7 @@ fn build_player_payload(players: &Value, gameflow: Option<&Value>, live: Option<
         serde_json::json!({
             "summonerName": p["summonerName"].as_str().unwrap_or(""),
             "riotIdGameName": p["riotIdGameName"].as_str().unwrap_or(""),
+            "playerId": normalize_player_id(p),
             "championName": champ,
             "ddKey": dd_key,
             "team": p["team"].as_str().unwrap_or(""),
@@ -958,21 +959,65 @@ fn normalize_player_id(p: &Value) -> String {
     ).to_lowercase()
 }
 
-fn compute_room_id(players: &[Value], own_team: &str) -> Option<String> {
+fn hash_player_ids(ids: &[String]) -> Option<String> {
     use sha2::{Digest, Sha256};
 
-    let mut allies: Vec<String> = players.iter()
+    if ids.is_empty() {
+        return None;
+    }
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    let input = sorted.join("||");
+    let hash = Sha256::digest(input.as_bytes());
+    Some(hex::encode(&hash[..12])) // 24 hex chars
+}
+
+fn compute_room_id(players: &[Value], own_team: &str) -> Option<String> {
+    let allies: Vec<String> = players.iter()
         .filter(|p| p["team"].as_str().unwrap_or("") == own_team)
         .map(|p| normalize_player_id(p))
         .filter(|s| !s.is_empty())
         .collect();
 
     if allies.len() != 5 { return None; }
+    hash_player_ids(&allies)
+}
 
-    allies.sort();
-    let input = allies.join("||");
-    let hash = Sha256::digest(input.as_bytes());
-    Some(hex::encode(&hash[..12])) // 24 hex chars
+fn compute_match_id(players: &[Value]) -> Option<String> {
+    let ids: Vec<String> = players.iter()
+        .map(|p| normalize_player_id(p))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Need a full lobby so both teams derive the same match room.
+    if ids.len() < 10 { return None; }
+    hash_player_ids(&ids)
+}
+
+fn resolve_local_player_id(players: &[Value], active: Option<&Value>) -> Option<String> {
+    let active = active?;
+    let active_name = active["summonerName"].as_str()
+        .or_else(|| active["riotId"].as_str())
+        .unwrap_or("")
+        .trim();
+    if active_name.is_empty() {
+        return None;
+    }
+
+    players.iter().find_map(|p| {
+        let sn = p["summonerName"].as_str().unwrap_or("");
+        let rn = p["riotIdGameName"].as_str().unwrap_or("");
+        let matched = sn == active_name
+            || rn == active_name
+            || sn.split('#').next() == active_name.split('#').next()
+            || rn == active_name.split('#').next().unwrap_or("");
+        if matched {
+            let id = normalize_player_id(p);
+            if id.is_empty() || id == "|" { None } else { Some(id) }
+        } else {
+            None
+        }
+    })
 }
 
 fn gameflow_phase(gameflow: Option<&Value>) -> &str {
@@ -1192,8 +1237,9 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                 mode,
             ));
 
-            // Determine own team
-            let own_team = if let Ok(active) = live_game::get_active_player().await {
+            // Determine own team and local player identity
+            let active_player = live_game::get_active_player().await.ok();
+            let own_team = if let Some(active) = active_player.as_ref() {
                 let active_name = active["summonerName"].as_str()
                     .or_else(|| active["riotId"].as_str())
                     .unwrap_or("")
@@ -1215,14 +1261,21 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                 String::new()
             };
 
-            // Compute room ID for sync
+            let players_arr = players.as_array().cloned().unwrap_or_default();
+            let local_player_id = resolve_local_player_id(players_arr.as_slice(), active_player.as_ref());
+
+            // Compute room IDs for cooldown sync (allies) and presence (full match)
             let room_id = if !own_team.is_empty() {
-                players.as_array()
-                    .and_then(|arr| compute_room_id(arr, &own_team))
+                compute_room_id(&players_arr, &own_team)
             } else {
                 None
             };
-            debug_log(&format!("own_team='{}' room_id={:?}", own_team, room_id));
+            let match_id = compute_match_id(&players_arr)
+                .or_else(|| room_id.clone());
+            debug_log(&format!(
+                "own_team='{}' room_id={:?} match_id={:?} local_player_id={:?}",
+                own_team, room_id, match_id, local_player_id
+            ));
 
             restore_saved_layout(&app, &state);
             clear_champ_select_swap_state(&state);
@@ -1233,6 +1286,8 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                 "ownTeam": own_team,
                 "mode": mode,
                 "roomId": room_id,
+                "matchId": match_id,
+                "localPlayerId": local_player_id,
             });
             *state.latest_game_data.lock().unwrap() = game_data.clone();
 

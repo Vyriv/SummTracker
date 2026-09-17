@@ -183,6 +183,11 @@ body.collapsed #content {
   object-fit: cover;
 }
 
+.champion-icon.summtracker-user {
+  border-color: rgba(110, 207, 142, 0.45);
+  box-shadow: 0 0 0 1px rgba(110, 207, 142, 0.18);
+}
+
 .player-info {
   flex: 1;
   min-width: 0;

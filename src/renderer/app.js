@@ -25,8 +25,10 @@ const DEFAULT_SETTINGS = {
 let settings = { ...DEFAULT_SETTINGS };
 
 let ownTeam = null;
+let localPlayerId = null;
 let enemyPlayerIndices = [];
 let pendingSyncEvents = [];
+let syncPeerIds = new Set();
 
 function saveSettings() {
   invoke('save_settings', { settings });
@@ -450,34 +452,42 @@ fetch('https://ddragon.leagueoflegends.com/api/versions.json')
   })
   .catch(() => {});
 
-// ── Room cooldown sync (api.vyriv.dev WebSocket relay) ──
+// ── Room cooldown sync + presence (api.vyriv.dev WebSocket relay) ──
 
 const SUMMTRACKER_WS_BASE = 'wss://api.vyriv.dev/v1/summtracker/room';
 const SYNC_RECONNECT_MIN_MS = 1000;
 const SYNC_RECONNECT_MAX_MS = 15000;
 
-let syncRoomId = null;
-let syncSocket = null;
-let syncSocketRoomId = null;
-let syncConnecting = false;
-let syncReconnectTimer = null;
-let syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
-let syncOutgoingQueue = [];
-let syncSocketGeneration = 0;
+function createRoomSocket(kind) {
+  return {
+    kind,
+    roomId: null,
+    socket: null,
+    socketRoomId: null,
+    connecting: false,
+    reconnectTimer: null,
+    reconnectDelayMs: SYNC_RECONNECT_MIN_MS,
+    outgoingQueue: [],
+    generation: 0,
+  };
+}
 
-function clearSyncReconnectTimer() {
-  if (syncReconnectTimer != null) {
-    clearTimeout(syncReconnectTimer);
-    syncReconnectTimer = null;
+const cooldownLink = createRoomSocket('cooldown');
+const presenceLink = createRoomSocket('presence');
+
+function clearLinkReconnectTimer(link) {
+  if (link.reconnectTimer != null) {
+    clearTimeout(link.reconnectTimer);
+    link.reconnectTimer = null;
   }
 }
 
-function closeSyncSocket() {
-  clearSyncReconnectTimer();
-  syncConnecting = false;
-  const socket = syncSocket;
-  syncSocket = null;
-  syncSocketRoomId = null;
+function closeRoomSocket(link) {
+  clearLinkReconnectTimer(link);
+  link.connecting = false;
+  const socket = link.socket;
+  link.socket = null;
+  link.socketRoomId = null;
   if (!socket) return;
   try {
     socket.onopen = null;
@@ -490,64 +500,122 @@ function closeSyncSocket() {
   }
 }
 
-function flushSyncOutgoingQueue() {
-  if (!syncSocket || syncSocket.readyState !== WebSocket.OPEN) return;
-  if (!syncOutgoingQueue.length) return;
-  const queued = syncOutgoingQueue.slice();
-  syncOutgoingQueue = [];
+function flushLinkOutgoingQueue(link) {
+  if (!link.socket || link.socket.readyState !== WebSocket.OPEN) return;
+  if (!link.outgoingQueue.length) return;
+  const queued = link.outgoingQueue.slice();
+  link.outgoingQueue = [];
   for (const payload of queued) {
     try {
-      syncSocket.send(JSON.stringify(payload));
+      link.socket.send(JSON.stringify(payload));
     } catch (_) {
-      syncOutgoingQueue.push(payload);
+      link.outgoingQueue.push(payload);
       break;
     }
   }
 }
 
-function scheduleSyncReconnect(roomId, generation) {
-  clearSyncReconnectTimer();
-  if (syncRoomId !== roomId) return;
-  syncReconnectTimer = setTimeout(() => {
-    syncReconnectTimer = null;
-    if (syncRoomId !== roomId || generation !== syncSocketGeneration) return;
-    connectSyncSocket(roomId, generation);
-  }, syncReconnectDelayMs);
-  syncReconnectDelayMs = Math.min(
+function enqueueLinkMessage(link, payload) {
+  if (
+    link.socket
+    && link.socket.readyState === WebSocket.OPEN
+    && link.socketRoomId === link.roomId
+  ) {
+    try {
+      link.socket.send(JSON.stringify(payload));
+      return;
+    } catch (_) {
+      // fall through to queue
+    }
+  }
+
+  link.outgoingQueue.push(payload);
+  if (link.outgoingQueue.length > 64) {
+    link.outgoingQueue = link.outgoingQueue.slice(-64);
+  }
+}
+
+function scheduleLinkReconnect(link, roomId, generation) {
+  clearLinkReconnectTimer(link);
+  if (link.roomId !== roomId) return;
+  link.reconnectTimer = setTimeout(() => {
+    link.reconnectTimer = null;
+    if (link.roomId !== roomId || generation !== link.generation) return;
+    connectRoomSocket(link, roomId, generation);
+  }, link.reconnectDelayMs);
+  link.reconnectDelayMs = Math.min(
     SYNC_RECONNECT_MAX_MS,
-    Math.round(syncReconnectDelayMs * 1.7),
+    Math.round(link.reconnectDelayMs * 1.7),
   );
 }
 
-function connectSyncSocket(roomId, generation) {
-  if (!roomId || syncRoomId !== roomId || generation !== syncSocketGeneration) return;
-  if (syncSocket || syncConnecting) return;
+function handlePresencePayload(payload) {
+  if (!payload || typeof payload !== 'object') return;
 
-  syncConnecting = true;
+  if (payload.action === 'peers' && Array.isArray(payload.playerIds)) {
+    syncPeerIds = new Set(
+      payload.playerIds
+        .filter((id) => typeof id === 'string' && id && id !== localPlayerId)
+        .map((id) => id.toLowerCase()),
+    );
+    applyPeerBorders();
+    return;
+  }
+
+  if (payload.action === 'peer-join' && typeof payload.playerId === 'string') {
+    const id = payload.playerId.toLowerCase();
+    if (!id || id === localPlayerId) return;
+    syncPeerIds.add(id);
+    applyPeerBorders();
+    return;
+  }
+
+  if (payload.action === 'peer-leave' && typeof payload.playerId === 'string') {
+    syncPeerIds.delete(payload.playerId.toLowerCase());
+    applyPeerBorders();
+  }
+}
+
+function sendPresenceHello(link) {
+  if (!localPlayerId || !link.roomId) return;
+  enqueueLinkMessage(link, { action: 'hello', playerId: localPlayerId });
+}
+
+function connectRoomSocket(link, roomId, generation) {
+  if (!roomId || link.roomId !== roomId || generation !== link.generation) return;
+  if (link.socket || link.connecting) return;
+
+  link.connecting = true;
   let socket;
   try {
     socket = new WebSocket(`${SUMMTRACKER_WS_BASE}/${roomId}`);
   } catch (_) {
-    syncConnecting = false;
-    scheduleSyncReconnect(roomId, generation);
+    link.connecting = false;
+    scheduleLinkReconnect(link, roomId, generation);
     return;
   }
 
-  syncSocket = socket;
-  syncSocketRoomId = roomId;
+  link.socket = socket;
+  link.socketRoomId = roomId;
 
   socket.onopen = () => {
-    if (generation !== syncSocketGeneration || syncRoomId !== roomId || syncSocket !== socket) {
+    if (generation !== link.generation || link.roomId !== roomId || link.socket !== socket) {
       try { socket.close(); } catch (_) {}
       return;
     }
-    syncConnecting = false;
-    syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
-    flushSyncOutgoingQueue();
+    link.connecting = false;
+    link.reconnectDelayMs = SYNC_RECONNECT_MIN_MS;
+    flushLinkOutgoingQueue(link);
+    if (link.kind === 'presence') {
+      sendPresenceHello(link);
+    } else if (!presenceLink.roomId && localPlayerId && link.roomId) {
+      // Presence is riding the cooldown socket for this match.
+      sendPresenceHello(link);
+    }
   };
 
   socket.onmessage = (event) => {
-    if (generation !== syncSocketGeneration || syncRoomId !== roomId || syncSocket !== socket) {
+    if (generation !== link.generation || link.roomId !== roomId || link.socket !== socket) {
       return;
     }
     let payload;
@@ -557,7 +625,20 @@ function connectSyncSocket(roomId, generation) {
       return;
     }
     if (!payload || typeof payload !== 'object') return;
-    queueOrApplySyncEvent(payload);
+
+    if (link.kind === 'presence') {
+      handlePresencePayload(payload);
+      return;
+    }
+
+    if (payload.action === 'peers' || payload.action === 'peer-join' || payload.action === 'peer-leave') {
+      handlePresencePayload(payload);
+      return;
+    }
+
+    if (payload.action === 'start' || payload.action === 'cancel') {
+      queueOrApplySyncEvent(payload);
+    }
   };
 
   socket.onerror = () => {
@@ -565,40 +646,73 @@ function connectSyncSocket(roomId, generation) {
   };
 
   socket.onclose = () => {
-    if (syncSocket === socket) {
-      syncSocket = null;
-      syncSocketRoomId = null;
+    if (link.socket === socket) {
+      link.socket = null;
+      link.socketRoomId = null;
     }
-    syncConnecting = false;
-    if (generation !== syncSocketGeneration || syncRoomId !== roomId) return;
-    scheduleSyncReconnect(roomId, generation);
+    link.connecting = false;
+    if (generation !== link.generation || link.roomId !== roomId) return;
+    scheduleLinkReconnect(link, roomId, generation);
   };
 }
 
-function syncToRoom(roomId) {
+function setRoomSocket(link, roomId) {
   const nextRoomId = roomId || null;
-  if (nextRoomId === syncRoomId) {
-    if (nextRoomId && !syncSocket && !syncConnecting && !syncReconnectTimer) {
-      const generation = ++syncSocketGeneration;
-      syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
-      connectSyncSocket(nextRoomId, generation);
+  if (nextRoomId === link.roomId) {
+    if (nextRoomId && !link.socket && !link.connecting && !link.reconnectTimer) {
+      const generation = ++link.generation;
+      link.reconnectDelayMs = SYNC_RECONNECT_MIN_MS;
+      connectRoomSocket(link, nextRoomId, generation);
+    } else if (nextRoomId && link.kind === 'presence' && localPlayerId) {
+      sendPresenceHello(link);
     }
     return;
   }
 
-  closeSyncSocket();
-  syncOutgoingQueue = [];
-  syncRoomId = nextRoomId;
-  syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
+  closeRoomSocket(link);
+  link.outgoingQueue = [];
+  link.roomId = nextRoomId;
+  link.reconnectDelayMs = SYNC_RECONNECT_MIN_MS;
 
-  if (!syncRoomId) return;
+  if (!link.roomId) return;
 
-  const generation = ++syncSocketGeneration;
-  connectSyncSocket(syncRoomId, generation);
+  const generation = ++link.generation;
+  connectRoomSocket(link, link.roomId, generation);
+}
+
+function clearPeerPresence() {
+  syncPeerIds = new Set();
+  applyPeerBorders();
+}
+
+function syncToRooms({ roomId = null, matchId = null, playerId = null } = {}) {
+  localPlayerId = playerId ? String(playerId).toLowerCase() : null;
+
+  const nextCooldownRoom = roomId || null;
+  const nextPresenceRoom = matchId || roomId || null;
+
+  if (!nextPresenceRoom) {
+    clearPeerPresence();
+  }
+
+  setRoomSocket(cooldownLink, nextCooldownRoom);
+
+  // Reuse the cooldown socket for presence when both rooms match.
+  if (nextPresenceRoom && nextPresenceRoom === nextCooldownRoom) {
+    closeRoomSocket(presenceLink);
+    presenceLink.roomId = null;
+    presenceLink.outgoingQueue = [];
+    if (localPlayerId) {
+      enqueueLinkMessage(cooldownLink, { action: 'hello', playerId: localPlayerId });
+    }
+    return;
+  }
+
+  setRoomSocket(presenceLink, nextPresenceRoom);
 }
 
 function publishSyncEvent(action, enemyIndex, spell, startedAt, durationMs) {
-  if (!syncRoomId) return;
+  if (!cooldownLink.roomId) return;
 
   const payload = { action, enemyIndex, spell };
   if (action === 'start') {
@@ -606,19 +720,17 @@ function publishSyncEvent(action, enemyIndex, spell, startedAt, durationMs) {
     payload.durationMs = durationMs;
   }
 
-  if (syncSocket && syncSocket.readyState === WebSocket.OPEN && syncSocketRoomId === syncRoomId) {
-    try {
-      syncSocket.send(JSON.stringify(payload));
-      return;
-    } catch (_) {
-      // fall through to queue
-    }
-  }
+  enqueueLinkMessage(cooldownLink, payload);
+}
 
-  syncOutgoingQueue.push(payload);
-  if (syncOutgoingQueue.length > 64) {
-    syncOutgoingQueue = syncOutgoingQueue.slice(-64);
-  }
+function applyPeerBorders() {
+  document.querySelectorAll('.player-row[data-player-id]').forEach((row) => {
+    const id = row.dataset.playerId || '';
+    const icon = row.querySelector('.champion-icon');
+    if (!icon) return;
+    const isPeer = Boolean(id) && id !== localPlayerId && syncPeerIds.has(id);
+    icon.classList.toggle('summtracker-user', isPeer);
+  });
 }
 
 // ── Cooldown timers ──
@@ -725,9 +837,14 @@ function buildPlayerRow(player, index, enemyIndex = null) {
   const row = document.createElement('div');
   row.className = 'player-row';
   row.dataset.playerIndex = index;
+  const playerId = String(player.playerId || '').toLowerCase();
+  if (playerId) row.dataset.playerId = playerId;
 
   const champImg = document.createElement('img');
   champImg.className = 'champion-icon';
+  if (playerId && playerId !== localPlayerId && syncPeerIds.has(playerId)) {
+    champImg.classList.add('summtracker-user');
+  }
   champImg.src = champIconUrl(player.ddKey);
   champImg.alt = player.championName;
   champImg.onerror = () => { champImg.style.background = '#222'; };
@@ -1334,14 +1451,18 @@ function handleGameData(data) {
     showScreen('game-screen');
     if (!settingsOpen) invoke('set_focusable', { focusable: false, stealFocus: false });
     syncGameHeight();
-    syncToRoom(data.roomId || null);
+    syncToRooms({
+      roomId: data.roomId || null,
+      matchId: data.matchId || null,
+      playerId: data.localPlayerId || null,
+    });
   } else if (data.state === 'champ-select' && data.benchEnabled) {
     const entering = !document.body.classList.contains('champ-select-active');
     if (entering) {
       resetAllCooldowns();
       enemyPlayerIndices = [];
       pendingSyncEvents = [];
-      syncToRoom(null);
+      syncToRooms();
       document.body.classList.add('champ-select-active');
       showScreen('champ-select-screen');
       // Only once on enter. Polling this every tick made clicks feel laggy.
@@ -1359,7 +1480,7 @@ function handleGameData(data) {
     resetAllCooldowns();
     enemyPlayerIndices = [];
     pendingSyncEvents = [];
-    syncToRoom(null);
+    syncToRooms();
     document.getElementById('titlebar-label').textContent = 'SummTracker';
     showScreen('idle-screen');
     lastChampSelect = null;
