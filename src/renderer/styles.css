@@ -512,3 +512,162 @@ body.hide-own-team .own-team { display: none; }
   color: #666;
   border-color: #333;
 }
+
+/* ── Prefer list panel ── */
+#prefer-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#prefer-panel.hidden {
+  display: none !important;
+}
+
+.prefer-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prefer-hint {
+  font-size: 10px;
+  color: #888;
+  line-height: 1.35;
+  padding: 0 2px;
+}
+
+.prefer-search-wrap {
+  -webkit-app-region: no-drag;
+}
+
+#prefer-search {
+  width: 100%;
+  background: #0d1018;
+  border: 1px solid rgba(200, 170, 90, 0.25);
+  color: #e8d5a3;
+  border-radius: 4px;
+  padding: 7px 8px;
+  font-size: 12px;
+  outline: none;
+}
+
+#prefer-search:focus {
+  border-color: rgba(200, 170, 90, 0.55);
+}
+
+.prefer-suggestions {
+  -webkit-app-region: no-drag;
+  max-height: 120px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.prefer-suggest {
+  -webkit-app-region: no-drag;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid transparent;
+  color: #e8d5a3;
+  border-radius: 4px;
+  padding: 4px 6px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 11px;
+}
+
+.prefer-suggest:hover {
+  border-color: rgba(200, 170, 90, 0.4);
+  background: rgba(200, 170, 90, 0.08);
+}
+
+.prefer-suggest img,
+.prefer-row img {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  object-fit: cover;
+  background: #111;
+}
+
+.prefer-list {
+  -webkit-app-region: no-drag;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: 6px;
+}
+
+.prefer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+
+.prefer-row .prefer-rank {
+  width: 18px;
+  font-size: 10px;
+  color: #c8aa5a;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.prefer-row .prefer-name {
+  flex: 1;
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prefer-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.prefer-actions button {
+  -webkit-app-region: no-drag;
+  width: 22px;
+  height: 22px;
+  border-radius: 3px;
+  border: 1px solid #333;
+  background: #141820;
+  color: #c8aa5a;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.prefer-actions button:hover:not(:disabled) {
+  border-color: #c8aa5a;
+}
+
+.prefer-actions button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.prefer-actions .prefer-remove {
+  color: #ff6b6b;
+}
+
+.prefer-empty {
+  font-size: 11px;
+  color: #666;
+  padding: 8px 2px;
+}
+
+.prefer-empty.hidden {
+  display: none;
+}

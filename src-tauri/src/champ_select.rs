@@ -1,6 +1,14 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use serde_json::{json, Value};
 
 use crate::lcu;
+
+fn summoner_alias_cache() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn json_i64(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_u64().map(|n| n as i64))
@@ -146,23 +154,49 @@ fn local_pick_action_id(session: &Value, local_cell: i64) -> Option<i64> {
     })
 }
 
+fn push_swap_entries_from_value(
+    value: &Value,
+    kind: &'static str,
+    trades: &mut Vec<(i64, i64, String, &'static str)>,
+) {
+    let Some(arr) = value.as_array() else {
+        // Ongoing swap payloads are a single object.
+        if let (Some(id), Some(cell)) = (json_i64(&value["id"]), json_i64(&value["cellId"])) {
+            trades.push((
+                id,
+                cell,
+                value["state"].as_str().unwrap_or("UNAVAILABLE").to_string(),
+                kind,
+            ));
+        }
+        return;
+    };
+    for trade in arr {
+        if let (Some(id), Some(cell)) = (json_i64(&trade["id"]), json_i64(&trade["cellId"])) {
+            let already = trades.iter().any(|(existing_id, existing_cell, _, existing_kind)| {
+                *existing_id == id && *existing_cell == cell && *existing_kind == kind
+            });
+            if already {
+                continue;
+            }
+            trades.push((
+                id,
+                cell,
+                trade["state"].as_str().unwrap_or("UNAVAILABLE").to_string(),
+                kind,
+            ));
+        }
+    }
+}
+
 fn push_swap_entries(
     session: &Value,
     key: &str,
     kind: &'static str,
     trades: &mut Vec<(i64, i64, String, &'static str)>,
 ) {
-    if let Some(arr) = session.get(key).and_then(Value::as_array) {
-        for trade in arr {
-            if let (Some(id), Some(cell)) = (json_i64(&trade["id"]), json_i64(&trade["cellId"])) {
-                trades.push((
-                    id,
-                    cell,
-                    trade["state"].as_str().unwrap_or("UNAVAILABLE").to_string(),
-                    kind,
-                ));
-            }
-        }
+    if let Some(value) = session.get(key) {
+        push_swap_entries_from_value(value, kind, trades);
     }
 }
 
@@ -183,21 +217,103 @@ fn trade_for_cell<'a>(
     trades
         .iter()
         .filter(|(_, cell, _, _)| *cell == cell_id)
-        .max_by_key(|(_, _, state, _)| trade_priority(state))
+        .max_by_key(|(_, _, state, kind)| {
+            (
+                trade_priority(state),
+                if *kind == "champion-swap" { 2 } else if *kind == "trade" { 1 } else { 0 },
+            )
+        })
 }
 
 fn member_name(member: &Value) -> String {
-    [
+    member_aliases(member)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn member_aliases(member: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<String>, value: String| {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
+            out.push(trimmed.to_string());
+        }
+    };
+
+    let game = [
         member.get("gameName").and_then(Value::as_str),
-        member.get("riotId").and_then(Value::as_str),
-        member.get("summonerName").and_then(Value::as_str),
-        member.get("playerAlias").and_then(Value::as_str),
+        member.get("riotIdGameName").and_then(Value::as_str),
     ]
     .into_iter()
     .flatten()
+    .map(str::trim)
     .find(|s| !s.is_empty())
-    .unwrap_or("")
-    .to_string()
+    .unwrap_or("");
+
+    let tag = [
+        member.get("tagLine").and_then(Value::as_str),
+        member.get("tagline").and_then(Value::as_str),
+        member.get("riotIdTagLine").and_then(Value::as_str),
+        member.get("riotIdTagline").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|s| !s.is_empty())
+    .unwrap_or("");
+
+    if !game.is_empty() && !tag.is_empty() {
+        push(&mut out, format!("{game}#{tag}"));
+    }
+    if !game.is_empty() {
+        push(&mut out, game.to_string());
+    }
+    for key in [
+        "riotId",
+        "summonerName",
+        "playerAlias",
+        "displayName",
+        "gameName",
+        "riotIdGameName",
+    ] {
+        if let Some(value) = member.get(key).and_then(Value::as_str) {
+            push(&mut out, value.to_string());
+        }
+    }
+    out
+}
+
+fn normalize_riot_id(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c {
+            '＃' | '﹟' => '#',
+            _ => c,
+        })
+        .collect()
+}
+
+/// Always-on auto-accept for champion swaps requested by these Riot IDs.
+fn is_trusted_trade_requester(name: &str) -> bool {
+    let n = normalize_riot_id(name);
+    if n.is_empty() {
+        return false;
+    }
+    if n == "umbreon#emii" || n.starts_with("umbreon#emii") {
+        return true;
+    }
+    if let Some((game, tag)) = n.split_once('#') {
+        return game == "umbreon" && tag == "emii";
+    }
+    // Some champ-select payloads omit the tag line.
+    n == "umbreon"
+}
+
+fn aliases_are_trusted(aliases: &[String]) -> bool {
+    aliases.iter().any(|alias| is_trusted_trade_requester(alias))
 }
 
 fn trade_entries(session: &Value) -> Vec<(i64, i64, String, &'static str)> {
@@ -206,6 +322,111 @@ fn trade_entries(session: &Value) -> Vec<(i64, i64, String, &'static str)> {
     push_swap_entries(session, "trades", "trade", &mut trades);
     push_swap_entries(session, "positionSwaps", "position-swap", &mut trades);
     push_swap_entries(session, "pickOrderSwaps", "pick-order-swap", &mut trades);
+    trades
+}
+
+fn summoner_aliases_from_payload(summoner: &Value) -> Vec<String> {
+    member_aliases(summoner)
+}
+
+async fn resolve_summoner_aliases(member: &Value) -> Vec<String> {
+    let mut aliases = member_aliases(member);
+    if aliases_are_trusted(&aliases) {
+        return aliases;
+    }
+
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(id) = json_i64(&member["summonerId"]).filter(|id| *id > 0) {
+        keys.push(format!("sid:{id}"));
+    }
+    if let Some(puuid) = member.get("puuid").and_then(Value::as_str).map(str::trim) {
+        if !puuid.is_empty() {
+            keys.push(format!("puuid:{puuid}"));
+        }
+    }
+    if let Some(cell) = json_i64(&member["cellId"]) {
+        keys.push(format!("cell:{cell}"));
+    }
+
+    {
+        let cache = summoner_alias_cache().lock().unwrap();
+        for key in &keys {
+            if let Some(cached) = cache.get(key) {
+                for alias in cached {
+                    if !aliases.iter().any(|existing| existing.eq_ignore_ascii_case(alias)) {
+                        aliases.push(alias.clone());
+                    }
+                }
+                if aliases_are_trusted(&aliases) {
+                    return aliases;
+                }
+            }
+        }
+    }
+
+    let mut fetched: Vec<String> = Vec::new();
+    if let Some(id) = json_i64(&member["summonerId"]).filter(|id| *id > 0) {
+        if let Ok(summoner) = lcu::lcu_fetch(&format!("/lol-summoner/v1/summoners/{id}")).await {
+            fetched.extend(summoner_aliases_from_payload(&summoner));
+        }
+    }
+    if fetched.is_empty() {
+        if let Some(puuid) = member.get("puuid").and_then(Value::as_str).map(str::trim) {
+            if !puuid.is_empty() {
+                if let Ok(summoner) =
+                    lcu::lcu_fetch(&format!("/lol-summoner/v2/summoners/puuid/{puuid}")).await
+                {
+                    fetched.extend(summoner_aliases_from_payload(&summoner));
+                }
+            }
+        }
+    }
+    if fetched.is_empty() {
+        if let Some(cell) = json_i64(&member["cellId"]) {
+            if let Ok(summoner) =
+                lcu::lcu_fetch(&format!("/lol-champ-select/v1/summoners/{cell}")).await
+            {
+                if let Some(arr) = summoner.as_array() {
+                    for item in arr {
+                        fetched.extend(summoner_aliases_from_payload(item));
+                    }
+                } else {
+                    fetched.extend(summoner_aliases_from_payload(&summoner));
+                }
+            }
+        }
+    }
+
+    for alias in &fetched {
+        if !aliases.iter().any(|existing| existing.eq_ignore_ascii_case(alias)) {
+            aliases.push(alias.clone());
+        }
+    }
+
+    if !fetched.is_empty() {
+        let mut cache = summoner_alias_cache().lock().unwrap();
+        for key in keys {
+            cache.insert(key, fetched.clone());
+        }
+    }
+
+    aliases
+}
+
+async fn collect_live_trades(session: &Value) -> Vec<(i64, i64, String, &'static str)> {
+    let mut trades = trade_entries(session);
+    let has_received = trades
+        .iter()
+        .any(|(_, _, state, _)| state.eq_ignore_ascii_case("RECEIVED"));
+    if has_received {
+        return trades;
+    }
+
+    // Only hit dedicated endpoints when the session blob has no RECEIVED swap yet.
+    if let Ok(value) = lcu::lcu_fetch("/lol-champ-select/v1/session/champion-swaps").await {
+        push_swap_entries_from_value(&value, "champion-swap", &mut trades);
+    }
+
     trades
 }
 
@@ -218,6 +439,24 @@ pub fn is_swap_session(session: &Value) -> bool {
     }
     // ARAM / Mayhem before bench ids populate still has rerolls.
     session.get("allowRerolling").and_then(Value::as_bool).unwrap_or(false)
+}
+
+pub fn local_champion_and_bench(session: &Value) -> (i64, Vec<i64>) {
+    let local_cell = json_i64(&session["localPlayerCellId"]).unwrap_or(-1);
+    let my = session
+        .get("myTeam")
+        .and_then(Value::as_array)
+        .and_then(|team| {
+            team.iter().find_map(|member| {
+                if json_i64(&member["cellId"]) == Some(local_cell) {
+                    json_i64(&member["championId"]).filter(|id| *id > 0)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(0);
+    (my, bench_ids(session))
 }
 
 pub fn build_payload(
@@ -248,6 +487,7 @@ pub fn build_payload(
                 "championId": champion_id,
                 "isLocal": is_local,
                 "displayName": member_name(member),
+                "nameAliases": member_aliases(member),
                 "tradeId": trade.map(|t| t.0),
                 "tradeState": trade.map(|t| t.2.clone()).unwrap_or_else(|| "UNAVAILABLE".to_string()),
                 "tradeKind": trade.map(|t| t.3).unwrap_or("trade"),
@@ -333,20 +573,157 @@ fn trade_path(kind: &str, trade_id: i64, action: &str) -> String {
     format!("/lol-champ-select/v1/session/{segment}/{trade_id}/{action}")
 }
 
+async fn trade_action(trade_id: i64, kind: Option<&str>, action: &str) -> Result<(), String> {
+    if trade_id < 0 {
+        return Err("Invalid trade".to_string());
+    }
+
+    let mut kinds: Vec<&str> = Vec::new();
+    if let Some(k) = kind {
+        kinds.push(k);
+    }
+    for k in ["champion-swap", "trade", "position-swap", "pick-order-swap"] {
+        if !kinds.iter().any(|existing| *existing == k) {
+            kinds.push(k);
+        }
+    }
+
+    let mut last_err = String::from("Trade failed");
+    for k in kinds {
+        match lcu::lcu_post(&trade_path(k, trade_id, action)).await {
+            Ok(_) => return Ok(()),
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
+}
+
 #[tauri::command]
 pub async fn request_trade(trade_id: i64, kind: Option<String>) -> Result<(), String> {
-    lcu::lcu_post(&trade_path(kind.as_deref().unwrap_or("trade"), trade_id, "request")).await?;
-    Ok(())
+    trade_action(trade_id, kind.as_deref(), "request").await
 }
 
 #[tauri::command]
 pub async fn accept_trade(trade_id: i64, kind: Option<String>) -> Result<(), String> {
-    lcu::lcu_post(&trade_path(kind.as_deref().unwrap_or("trade"), trade_id, "accept")).await?;
-    Ok(())
+    trade_action(trade_id, kind.as_deref(), "accept").await
 }
 
 #[tauri::command]
 pub async fn decline_trade(trade_id: i64, kind: Option<String>) -> Result<(), String> {
-    lcu::lcu_post(&trade_path(kind.as_deref().unwrap_or("trade"), trade_id, "decline")).await?;
-    Ok(())
+    trade_action(trade_id, kind.as_deref(), "decline").await
+}
+
+/// Auto-accept incoming champion swaps from trusted Riot IDs (always on).
+pub async fn auto_accept_trusted_trades(session: &Value, last_accepted: &std::sync::atomic::AtomicI64) {
+    use std::sync::atomic::Ordering;
+
+    let local_cell = json_i64(&session["localPlayerCellId"]).unwrap_or(-1);
+    let my_team = session
+        .get("myTeam")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let trades = collect_live_trades(session).await;
+
+    for (trade_id, cell_id, state, kind) in trades {
+        if !state.eq_ignore_ascii_case("RECEIVED") {
+            continue;
+        }
+        if cell_id == local_cell {
+            continue;
+        }
+        if trade_id == last_accepted.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        let member = my_team
+            .iter()
+            .find(|m| json_i64(&m["cellId"]) == Some(cell_id));
+
+        let aliases = if let Some(m) = member {
+            resolve_summoner_aliases(m).await
+        } else {
+            Vec::new()
+        };
+
+        let accept = if !aliases.is_empty() {
+            aliases_are_trusted(&aliases)
+        } else {
+            // Cell could not be mapped / named. Fall back only when exactly one
+            // teammate resolves as the trusted Riot ID.
+            let mut trusted_count = 0usize;
+            for m in &my_team {
+                if json_i64(&m["cellId"]) == Some(local_cell) {
+                    continue;
+                }
+                if aliases_are_trusted(&resolve_summoner_aliases(m).await) {
+                    trusted_count += 1;
+                }
+            }
+            trusted_count == 1
+        };
+
+        if !accept {
+            continue;
+        }
+
+        let name = aliases
+            .into_iter()
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "umbreon#emii".to_string());
+
+        match accept_trade_all_endpoints(trade_id).await {
+            Ok(used_kind) => {
+                last_accepted.store(trade_id, Ordering::Relaxed);
+                eprintln!(
+                    "[summtracker] auto-accepted champion swap from {name} (trade {trade_id}, via {used_kind}; hinted {kind})"
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "[summtracker] auto-accept swap from {name} failed (trade {trade_id}, kind {kind}): {err}"
+                );
+            }
+        }
+    }
+}
+
+async fn accept_trade_all_endpoints(trade_id: i64) -> Result<&'static str, String> {
+    let endpoints = [
+        (
+            "champion-swap",
+            format!("/lol-champ-select/v1/session/champion-swaps/{trade_id}/accept"),
+        ),
+        (
+            "trade",
+            format!("/lol-champ-select/v1/session/trades/{trade_id}/accept"),
+        ),
+        (
+            "lobby-champion-swap",
+            format!(
+                "/lol-lobby-team-builder/champ-select/v1/session/champion-swaps/{trade_id}/accept"
+            ),
+        ),
+        (
+            "lobby-trade",
+            format!("/lol-lobby-team-builder/champ-select/v1/session/trades/{trade_id}/accept"),
+        ),
+        (
+            "position-swap",
+            format!("/lol-champ-select/v1/session/position-swaps/{trade_id}/accept"),
+        ),
+        (
+            "pick-order-swap",
+            format!("/lol-champ-select/v1/session/pick-order-swaps/{trade_id}/accept"),
+        ),
+    ];
+    let mut last_err = String::from("Trade failed");
+    for (kind, path) in endpoints {
+        match lcu::lcu_post(&path).await {
+            Ok(_) => return Ok(kind),
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
 }

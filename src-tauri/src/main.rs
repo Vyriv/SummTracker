@@ -51,8 +51,11 @@ const NATURAL_WIDTH: u32 = 320;
 // Layout height at 320px width before scaling (titlebar + allies + bench).
 const CHAMP_SELECT_NATURAL_HEIGHT: f64 = 400.0;
 const CHAMP_SELECT_WIDTH: u32 = 400;
-const CHAMP_SELECT_POLL_MS: u64 = 16;
+/// UI / session refresh for champ select overlay.
+const CHAMP_SELECT_UI_POLL_MS: u64 = 16;
+/// Steal / queued swap / trusted trade hammer rate.
 const PENDING_SWAP_POLL_MS: u64 = 8;
+const TRUSTED_TRADE_POLL_MS: u64 = 8;
 const SETTINGS_FILE: &str = "settings.json";
 const BOUNDS_FILE: &str = "bounds.json";
 
@@ -95,6 +98,20 @@ struct AppState {
     auto_accept_queue: AtomicBool,
     /// Champion id to steal as soon as it unlocks. `0` means none.
     pending_bench_swap: AtomicI64,
+    /// True when pending swap came from a manual bench click.
+    manual_bench_swap: AtomicBool,
+    /// After a manual pick/swap, stop prefer-list from swapping the player away.
+    prefer_suppressed: AtomicBool,
+    /// Last observed local champion id during champ select (for external swap detection).
+    last_my_champion: AtomicI64,
+    /// Prefer-list steal currently in flight (so we do not treat it as a manual override).
+    last_prefer_steal_target: AtomicI64,
+    /// Prefer-list champion ids, highest priority first.
+    prefer_list: Mutex<Vec<i64>>,
+    /// Last trade id auto-accepted from a trusted requester.
+    last_auto_accepted_trade: AtomicI64,
+    /// Fingerprint of last emitted champ-select payload (skip identical UI emits).
+    last_cs_emit_key: Mutex<String>,
 }
 
 fn data_path(app: &AppHandle, file: &str) -> std::path::PathBuf {
@@ -358,8 +375,35 @@ fn save_settings_to_disk(app: &AppHandle, settings: &Value) {
     }
 }
 
-#[tauri::command]
-fn save_settings(app: AppHandle, state: State<Arc<AppState>>, settings: Value) {
+fn parse_prefer_list(settings: &Value) -> Vec<i64> {
+    let Some(arr) = settings.get("preferList").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in arr {
+        let id = entry
+            .get("id")
+            .and_then(json_id)
+            .or_else(|| json_id(entry))
+            .unwrap_or(0);
+        if id > 0 && seen.insert(id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+fn json_id(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|n| n as i64))
+        .or_else(|| value.as_f64().map(|n| n as i64))
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .filter(|n| *n > 0)
+}
+
+fn apply_settings_state(state: &AppState, settings: &Value) {
     state.auto_accept_queue.store(
         settings
             .get("autoAcceptQueue")
@@ -367,7 +411,30 @@ fn save_settings(app: AppHandle, state: State<Arc<AppState>>, settings: Value) {
             .unwrap_or(false),
         Ordering::Relaxed,
     );
+    *state.prefer_list.lock().unwrap() = parse_prefer_list(settings);
+}
+
+/// Highest-priority prefer champ that is either already owned or on the bench.
+fn prefer_target_id(prefer_list: &[i64], my_champion_id: i64, bench: &[i64]) -> i64 {
+    for &id in prefer_list {
+        if id == my_champion_id || bench.contains(&id) {
+            return id;
+        }
+    }
+    0
+}
+
+#[tauri::command]
+fn save_settings(app: AppHandle, state: State<Arc<AppState>>, settings: Value) {
+    apply_settings_state(state.as_ref(), &settings);
     save_settings_to_disk(&app, &settings);
+}
+
+#[tauri::command]
+fn close_prefer_list_window(app: AppHandle) {
+    if let Some(existing) = app.get_webview_window("prefer-list") {
+        let _ = existing.close();
+    }
 }
 
 #[tauri::command]
@@ -555,11 +622,91 @@ fn update_collapse_bind(bind: Option<Value>) {
 fn set_pending_bench_swap(state: State<Arc<AppState>>, champion_id: Option<i64>) {
     let id = champion_id.filter(|id| *id > 0).unwrap_or(0);
     state.pending_bench_swap.store(id, Ordering::Relaxed);
-    debug_log(&format!("pending bench swap -> {id}"));
+    state.manual_bench_swap.store(id > 0, Ordering::Relaxed);
+    if id > 0 {
+        // Any manual bench click means the player took over; stop prefer-list for this CS.
+        state.prefer_suppressed.store(true, Ordering::Relaxed);
+        state.last_prefer_steal_target.store(0, Ordering::Relaxed);
+    }
+    debug_log(&format!("pending bench swap -> {id} (manual={})", id > 0));
+}
+
+#[tauri::command]
+fn suppress_prefer_list(state: State<Arc<AppState>>, champion_id: Option<i64>) {
+    let id = champion_id.filter(|id| *id > 0).unwrap_or(0);
+    state.prefer_suppressed.store(true, Ordering::Relaxed);
+    state.last_prefer_steal_target.store(0, Ordering::Relaxed);
+    // Drop any prefer-driven pending swap so it cannot override a manual pick.
+    if !state.manual_bench_swap.load(Ordering::Relaxed) {
+        state.pending_bench_swap.store(0, Ordering::Relaxed);
+    }
+    debug_log(&format!(
+        "prefer list suppressed for this champ select (manual champ={id})"
+    ));
 }
 
 fn clear_pending_bench_swap(state: &AppState) {
     state.pending_bench_swap.store(0, Ordering::Relaxed);
+    state.manual_bench_swap.store(false, Ordering::Relaxed);
+}
+
+fn clear_champ_select_swap_state(state: &AppState) {
+    clear_pending_bench_swap(state);
+    state.prefer_suppressed.store(false, Ordering::Relaxed);
+    state.last_my_champion.store(0, Ordering::Relaxed);
+    state.last_prefer_steal_target.store(0, Ordering::Relaxed);
+    state.last_auto_accepted_trade.store(-1, Ordering::Relaxed);
+    *state.last_cs_emit_key.lock().unwrap() = String::new();
+}
+
+fn champ_select_emit_key(payload: &Value) -> String {
+    let my = payload.get("myChampionId").and_then(Value::as_i64).unwrap_or(0);
+    let pick = payload.get("pickActionId").cloned().unwrap_or(Value::Null);
+    let prefer = payload.get("preferTargetId").and_then(Value::as_i64).unwrap_or(0);
+    let phase = payload.get("phase").and_then(Value::as_str).unwrap_or("");
+    let mode = payload.get("mode").and_then(Value::as_str).unwrap_or("");
+    let bench = payload
+        .get("bench")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_i64)
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let cards = payload
+        .get("cards")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_i64)
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let allies = payload
+        .get("allies")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|a| {
+                    format!(
+                        "{}:{}:{}:{}:{}",
+                        a.get("cellId").and_then(Value::as_i64).unwrap_or(-1),
+                        a.get("championId").and_then(Value::as_i64).unwrap_or(0),
+                        a.get("tradeState").and_then(Value::as_str).unwrap_or(""),
+                        a.get("tradeId").and_then(Value::as_i64).unwrap_or(-1),
+                        a.get("tradeKind").and_then(Value::as_str).unwrap_or(""),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .unwrap_or_default();
+    format!("{mode}|{phase}|{my}|{pick}|{prefer}|{bench}|{cards}|{allies}")
 }
 
 async fn pending_bench_swap_loop(state: Arc<AppState>) {
@@ -574,6 +721,80 @@ async fn pending_bench_swap_loop(state: Arc<AppState>) {
         }
         // Hammer the swap endpoint so a queued champ is taken the instant it unlocks.
         let _ = champ_select::swap_bench_inner(champion_id).await;
+    }
+}
+
+/// Dedicated prefer-list steal loop so bench targets are not missed between UI polls.
+async fn prefer_steal_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(PENDING_SWAP_POLL_MS)).await;
+        if *state.game_state.lock().unwrap() != GameState::ChampSelect {
+            continue;
+        }
+        let Some(session) = lcu::get_champ_select_session().await else {
+            continue;
+        };
+        let (my, bench) = champ_select::local_champion_and_bench(&session);
+
+        // If the local champ changed to something we did not just prefer-steal,
+        // the player (or League UI) overrode us. Stop prefer for this CS.
+        let prev = state.last_my_champion.swap(my, Ordering::Relaxed);
+        if prev > 0 && my > 0 && prev != my {
+            let prefer_target = state.last_prefer_steal_target.load(Ordering::Relaxed);
+            let pending = state.pending_bench_swap.load(Ordering::Relaxed);
+            let our_steal = my == prefer_target || my == pending;
+            if our_steal {
+                state.last_prefer_steal_target.store(0, Ordering::Relaxed);
+            } else {
+                state.prefer_suppressed.store(true, Ordering::Relaxed);
+                state.last_prefer_steal_target.store(0, Ordering::Relaxed);
+                if !state.manual_bench_swap.load(Ordering::Relaxed) {
+                    state.pending_bench_swap.store(0, Ordering::Relaxed);
+                }
+                debug_log(&format!(
+                    "prefer suppressed after local champ changed {prev} -> {my}"
+                ));
+            }
+        }
+
+        if state.prefer_suppressed.load(Ordering::Relaxed)
+            || state.manual_bench_swap.load(Ordering::Relaxed)
+        {
+            continue;
+        }
+        let prefer = state.prefer_list.lock().unwrap().clone();
+        if prefer.is_empty() {
+            continue;
+        }
+        let target = prefer_target_id(&prefer, my, &bench);
+        if target <= 0 || target == my {
+            continue;
+        }
+        state.last_prefer_steal_target.store(target, Ordering::Relaxed);
+        state.pending_bench_swap.store(target, Ordering::Relaxed);
+        let _ = champ_select::swap_bench_inner(target).await;
+    }
+}
+
+/// Dedicated fast path so trusted trade accepts are not stuck behind UI payload work.
+async fn trusted_trade_accept_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(TRUSTED_TRADE_POLL_MS)).await;
+        // Keep polling whenever the client is in champ select, even if our state
+        // flag briefly lags behind.
+        let in_cs = *state.game_state.lock().unwrap() == GameState::ChampSelect;
+        let session = if in_cs {
+            lcu::get_champ_select_session().await
+        } else if lcu::is_client_running() {
+            // Catch the first moments of CS before game_loop flips state.
+            lcu::get_champ_select_session().await.filter(|s| champ_select::is_swap_session(s))
+        } else {
+            None
+        };
+        let Some(session) = session else {
+            continue;
+        };
+        champ_select::auto_accept_trusted_trades(&session, &state.last_auto_accepted_trade).await;
     }
 }
 
@@ -810,6 +1031,106 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
     loop {
         tokio::time::sleep(delay).await;
 
+        // Champ-select hot path: session only. Prefer/trade/swap loops run separately at 8ms.
+        if *state.game_state.lock().unwrap() == GameState::ChampSelect {
+            if !lcu::is_client_running() {
+                clear_champ_select_swap_state(&state);
+                restore_saved_layout(&app, &state);
+                *state.game_state.lock().unwrap() = GameState::Idle;
+                *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
+                let win = app.get_webview_window("main").unwrap();
+                let _ = win.hide();
+                let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
+                delay = Duration::from_secs(3);
+                continue;
+            }
+
+            match lcu::get_champ_select_session().await {
+                Some(s) if champ_select::is_swap_session(&s) => {
+                    let my_now = champ_select::local_champion_and_bench(&s).0;
+                    let (pickable, subset) = if my_now <= 0 {
+                        tokio::join!(
+                            lcu::get_pickable_champions(),
+                            lcu::get_subset_champion_list(),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let mut payload = champ_select::build_payload(&s, None, pickable.as_ref(), subset.as_ref());
+                    let prefer = state.prefer_list.lock().unwrap().clone();
+                    let my = payload
+                        .get("myChampionId")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let bench: Vec<i64> = payload
+                        .get("bench")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_i64)
+                                .filter(|id| *id > 0)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let prefer_target = if state.prefer_suppressed.load(Ordering::Relaxed)
+                        || state.manual_bench_swap.load(Ordering::Relaxed)
+                    {
+                        0
+                    } else {
+                        prefer_target_id(&prefer, my, &bench)
+                    };
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("preferTargetId".into(), serde_json::json!(prefer_target));
+                    }
+                    let pending = state.pending_bench_swap.load(Ordering::Relaxed);
+                    if pending > 0 && my == pending {
+                        clear_pending_bench_swap(&state);
+                    }
+
+                    let key = champ_select_emit_key(&payload);
+                    let should_emit = {
+                        let mut last = state.last_cs_emit_key.lock().unwrap();
+                        if *last != key {
+                            *last = key;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    *state.latest_game_data.lock().unwrap() = payload.clone();
+                    if should_emit {
+                        let _ = app.emit("game-data", payload);
+                    }
+                    delay = Duration::from_millis(CHAMP_SELECT_UI_POLL_MS);
+                    continue;
+                }
+                Some(_) => {
+                    debug_log("non-bench champ select -> idle overlay");
+                    restore_saved_layout(&app, &state);
+                    clear_champ_select_swap_state(&state);
+                    *state.game_state.lock().unwrap() = GameState::Idle;
+                    *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
+                    let win = app.get_webview_window("main").unwrap();
+                    let _ = win.hide();
+                    let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
+                    delay = Duration::from_millis(400);
+                    continue;
+                }
+                None => {
+                    debug_log("champ select ended -> idle");
+                    clear_champ_select_swap_state(&state);
+                    restore_saved_layout(&app, &state);
+                    *state.game_state.lock().unwrap() = GameState::Idle;
+                    *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
+                    let win = app.get_webview_window("main").unwrap();
+                    let _ = win.hide();
+                    let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
+                    delay = Duration::from_millis(400);
+                    continue;
+                }
+            }
+        }
+
         let lcu_running = lcu::is_client_running();
         let (live_up, gameflow_quick) = tokio::join!(
             live_game::is_game_running(),
@@ -904,7 +1225,7 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
             debug_log(&format!("own_team='{}' room_id={:?}", own_team, room_id));
 
             restore_saved_layout(&app, &state);
-            clear_pending_bench_swap(&state);
+            clear_champ_select_swap_state(&state);
             *state.game_state.lock().unwrap() = GameState::InGame;
             let game_data = serde_json::json!({
                 "state": "in-game",
@@ -917,6 +1238,9 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
 
             let win = app.get_webview_window("main").unwrap();
             let _ = win.show();
+            if let Some(prefer) = app.get_webview_window("prefer-list") {
+                let _ = prefer.close();
+            }
 
             let _ = app.emit("game-data", game_data);
 
@@ -971,69 +1295,68 @@ async fn game_loop(app: AppHandle, state: Arc<AppState>) {
                 current_state,
                 phase,
             ));
-            match (session, current_state) {
-                (Some(s), GameState::Idle) | (Some(s), GameState::ChampSelect) => {
-                    if !champ_select::is_swap_session(&s) {
-                        if current_state == GameState::ChampSelect {
-                            debug_log("non-bench champ select -> idle overlay");
-                            restore_saved_layout(&app, &state);
-                            *state.game_state.lock().unwrap() = GameState::Idle;
-                            *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
-                            let win = app.get_webview_window("main").unwrap();
-                            let _ = win.hide();
-                            let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
-                        }
-                        delay = Duration::from_millis(400);
-                        continue;
-                    }
-
-                    let (gameflow, pickable, subset) = tokio::join!(
-                        async { gameflow_quick.clone() },
-                        lcu::get_pickable_champions(),
-                        lcu::get_subset_champion_list(),
-                    );
-                    let payload = champ_select::build_payload(
-                        &s,
-                        gameflow.as_ref(),
-                        pickable.as_ref(),
-                        subset.as_ref(),
-                    );
-                    let pending = state.pending_bench_swap.load(Ordering::Relaxed);
-                    if pending > 0
-                        && payload
-                            .get("myChampionId")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0)
-                            == pending
-                    {
-                        clear_pending_bench_swap(&state);
-                    }
-                    debug_log("entering/staying ARAM champ select");
-                    enter_champ_select_layout(&app, &state);
-                    *state.game_state.lock().unwrap() = GameState::ChampSelect;
-                    *state.latest_game_data.lock().unwrap() = payload.clone();
-                    let win = app.get_webview_window("main").unwrap();
-                    show_without_activate(&win);
-                    let _ = app.emit("game-data", payload);
-                    delay = Duration::from_millis(CHAMP_SELECT_POLL_MS);
+            if let (Some(s), GameState::Idle) = (session, current_state) {
+                if !champ_select::is_swap_session(&s) {
+                    delay = Duration::from_millis(400);
                     continue;
                 }
-                (None, GameState::ChampSelect) => {
-                    debug_log("champ select ended -> idle");
-                    clear_pending_bench_swap(&state);
-                    restore_saved_layout(&app, &state);
-                    *state.game_state.lock().unwrap() = GameState::Idle;
-                    *state.latest_game_data.lock().unwrap() = serde_json::json!({ "state": "idle" });
-                    let win = app.get_webview_window("main").unwrap();
-                    let _ = win.hide();
-                    let _ = app.emit("game-data", serde_json::json!({ "state": "idle" }));
+
+                let my_now = champ_select::local_champion_and_bench(&s).0;
+                let (pickable, subset) = if my_now <= 0 {
+                    tokio::join!(
+                        lcu::get_pickable_champions(),
+                        lcu::get_subset_champion_list(),
+                    )
+                } else {
+                    (None, None)
+                };
+                let mut payload = champ_select::build_payload(
+                    &s,
+                    gameflow_quick.as_ref(),
+                    pickable.as_ref(),
+                    subset.as_ref(),
+                );
+                let prefer = state.prefer_list.lock().unwrap().clone();
+                let my = payload
+                    .get("myChampionId")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let bench: Vec<i64> = payload
+                    .get("bench")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_i64)
+                            .filter(|id| *id > 0)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let prefer_target = if state.prefer_suppressed.load(Ordering::Relaxed)
+                    || state.manual_bench_swap.load(Ordering::Relaxed)
+                {
+                    0
+                } else {
+                    prefer_target_id(&prefer, my, &bench)
+                };
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("preferTargetId".into(), serde_json::json!(prefer_target));
                 }
-                _ => {}
+                let key = champ_select_emit_key(&payload);
+                *state.last_cs_emit_key.lock().unwrap() = key;
+                debug_log("entering ARAM champ select");
+                enter_champ_select_layout(&app, &state);
+                *state.game_state.lock().unwrap() = GameState::ChampSelect;
+                *state.latest_game_data.lock().unwrap() = payload.clone();
+                let win = app.get_webview_window("main").unwrap();
+                show_without_activate(&win);
+                let _ = app.emit("game-data", payload);
+                delay = Duration::from_millis(CHAMP_SELECT_UI_POLL_MS);
+                continue;
             }
         }
 
         delay = match *state.game_state.lock().unwrap() {
-            GameState::ChampSelect => Duration::from_millis(CHAMP_SELECT_POLL_MS),
+            GameState::ChampSelect => Duration::from_millis(CHAMP_SELECT_UI_POLL_MS),
             GameState::InGame => Duration::from_secs(3),
             GameState::Idle => {
                 if queue_hot && state.auto_accept_queue.load(Ordering::Relaxed) {
@@ -1225,23 +1548,28 @@ pub fn run() {
                 in_champ_select: Mutex::new(false),
                 auto_accept_queue: AtomicBool::new(false),
                 pending_bench_swap: AtomicI64::new(0),
+                manual_bench_swap: AtomicBool::new(false),
+                prefer_suppressed: AtomicBool::new(false),
+                last_my_champion: AtomicI64::new(0),
+                last_prefer_steal_target: AtomicI64::new(0),
+                prefer_list: Mutex::new(Vec::new()),
+                last_auto_accepted_trade: AtomicI64::new(-1),
+                last_cs_emit_key: Mutex::new(String::new()),
             });
 
             app.manage(state.clone());
             let saved_settings = load_settings(app.handle().clone());
-            state.auto_accept_queue.store(
-                saved_settings
-                    .get("autoAcceptQueue")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                Ordering::Relaxed,
-            );
+            apply_settings_state(state.as_ref(), &saved_settings);
             debug_log(&format!(
                 "startup collapseBind={}",
                 saved_settings.get("collapseBind").cloned().unwrap_or(Value::Null)
             ));
             apply_collapse_bind(saved_settings.get("collapseBind").cloned());
             ensure_default_autostart(&app.handle());
+            // Kill any leftover blank prefer-list window from older builds.
+            if let Some(existing) = app.handle().get_webview_window("prefer-list") {
+                let _ = existing.close();
+            }
 
             {
                 let app = app.handle().clone();
@@ -1350,6 +1678,16 @@ pub fn run() {
                 pending_bench_swap_loop(pending_swap_state).await;
             });
 
+            let prefer_steal_state = Arc::clone(&state);
+            tauri::async_runtime::spawn(async move {
+                prefer_steal_loop(prefer_steal_state).await;
+            });
+
+            let trusted_trade_state = Arc::clone(&state);
+            tauri::async_runtime::spawn(async move {
+                trusted_trade_accept_loop(trusted_trade_state).await;
+            });
+
             let app_handle3 = app.handle().clone();
             let state_clone2 = Arc::clone(&state);
             tauri::async_runtime::spawn(async move {
@@ -1376,6 +1714,8 @@ pub fn run() {
             quit_app,
             update_collapse_bind,
             set_pending_bench_swap,
+            suppress_prefer_list,
+            close_prefer_list_window,
             champ_select::swap_bench,
             champ_select::complete_pick,
             champ_select::request_trade,

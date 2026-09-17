@@ -1,6 +1,6 @@
 {
   "productName": "SummTracker",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "identifier": "com.vyriv.summtracker",
   "build": {
     "beforeDevCommand": "npm run vite:dev",
@@ -9,8 +9,8 @@
     "frontendDist": "../dist"
   },
   "bundle": {
-    "active": true,
-    "targets": ["nsis"],
+    "active": false,
+    "targets": [],
     "icon": ["icons/tray-icon.png"],
     "windows": {
       "nsis": {

@@ -1,6 +1,6 @@
 {
   "name": "summtracker",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "League of Legends summoner spell & ultimate tracker overlay",
   "scripts": {
     "dev": "tauri dev",
@@ -16,7 +16,6 @@
     "vite": "^6"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.108.2",
     "@tauri-apps/api": "^2.11.0"
   }
 }

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Prefer list</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #05080f;
+      color: #e8d5a3;
+      font-family: "Segoe UI", sans-serif;
+    }
+  </style>
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./prefer.css" />
+</head>
+<body class="prefer-window">
+  <div id="app" class="prefer-app">
+    <div id="titlebar">
+      <span id="titlebar-label">Prefer list</span>
+      <button id="close-btn" title="Close">✕</button>
+    </div>
+    <div id="content" class="prefer-content">
+      <p class="prefer-hint">Higher on the list wins. If several are on the bench, the top one is taken.</p>
+      <div class="prefer-search-wrap">
+        <input id="prefer-search" type="text" placeholder="Search champions..." autocomplete="off" spellcheck="false" />
+      </div>
+      <div id="prefer-suggestions" class="prefer-suggestions"></div>
+      <div class="team-label">Your priority list</div>
+      <div id="prefer-list" class="prefer-list"></div>
+      <div id="prefer-empty" class="prefer-empty">No champions yet. Search above to add some.</div>
+    </div>
+  </div>
+  <script type="module" src="./prefer.js"></script>
+</body>
+</html>

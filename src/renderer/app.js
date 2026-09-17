@@ -1,6 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { createClient } from '@supabase/supabase-js';
 import {
   getSummonerSpell,
   getUltCooldowns,
@@ -20,6 +19,7 @@ const DEFAULT_SETTINGS = {
   opacity: 90,
   collapseBind: null,
   autoAcceptQueue: false,
+  preferList: [],
 };
 
 let settings = { ...DEFAULT_SETTINGS };
@@ -101,6 +101,39 @@ function initSettingsPanel() {
     saveSettings();
   });
 
+  const preferBtn = document.getElementById('s-prefer-list');
+  if (preferBtn) {
+    preferBtn.addEventListener('click', () => {
+      setPreferOpen(true);
+    });
+  }
+
+  const preferBack = document.getElementById('prefer-back');
+  if (preferBack) {
+    preferBack.addEventListener('click', () => {
+      setPreferOpen(false);
+      settingsOpen = true;
+      document.getElementById('settings-btn').classList.add('active');
+      document.getElementById('settings-panel').classList.remove('hidden');
+      document.getElementById('prefer-panel').classList.add('hidden');
+      document.getElementById('game-screen').classList.add('hidden');
+      document.getElementById('idle-screen').classList.add('hidden');
+      document.getElementById('champ-select-screen').classList.add('hidden');
+      invoke('set_focusable', { focusable: true, stealFocus: false });
+      syncGameHeight(true);
+    });
+  }
+
+  const preferSearch = document.getElementById('prefer-search');
+  if (preferSearch) {
+    preferSearch.addEventListener('input', e => renderPreferSuggestions(e.target.value));
+    preferSearch.addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      const first = document.querySelector('#prefer-suggestions .prefer-suggest');
+      if (first) first.click();
+    });
+  }
+
   document.querySelectorAll('.fmt-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       settings.format = btn.dataset.fmt;
@@ -166,11 +199,201 @@ function initSettingsPanel() {
 }
 
 let settingsOpen = false;
+let preferOpen = false;
+let preferChampions = [];
+
+function champSelectIconUrlPrefer(id) {
+  return `https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/${id}.png`;
+}
+
+function normalizePreferList(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const entry of list) {
+    const id = Number(entry?.id ?? entry);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const name = entry?.name || preferChampions.find(c => c.key === id)?.name || champById[id]?.name || `Champ ${id}`;
+    out.push({ id, name });
+  }
+  return out;
+}
+
+function savePreferList() {
+  settings.preferList = normalizePreferList(settings.preferList);
+  saveSettings();
+}
+
+function renderPreferList() {
+  const listEl = document.getElementById('prefer-list');
+  const emptyEl = document.getElementById('prefer-empty');
+  if (!listEl || !emptyEl) return;
+  const list = Array.isArray(settings.preferList) ? settings.preferList : [];
+  listEl.innerHTML = '';
+  emptyEl.classList.toggle('hidden', list.length > 0);
+
+  list.forEach((entry, index) => {
+    const row = document.createElement('div');
+    row.className = 'prefer-row';
+
+    const rank = document.createElement('div');
+    rank.className = 'prefer-rank';
+    rank.textContent = String(index + 1);
+    row.appendChild(rank);
+
+    const img = document.createElement('img');
+    img.src = champSelectIconUrlPrefer(entry.id);
+    img.alt = entry.name;
+    img.onerror = () => { img.style.background = '#222'; };
+    row.appendChild(img);
+
+    const name = document.createElement('div');
+    name.className = 'prefer-name';
+    name.textContent = entry.name;
+    row.appendChild(name);
+
+    const actions = document.createElement('div');
+    actions.className = 'prefer-actions';
+
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.title = 'Move up';
+    up.textContent = '▲';
+    up.disabled = index === 0;
+    up.addEventListener('click', () => movePreferEntry(index, -1));
+
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.title = 'Move down';
+    down.textContent = '▼';
+    down.disabled = index === list.length - 1;
+    down.addEventListener('click', () => movePreferEntry(index, 1));
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'prefer-remove';
+    remove.title = 'Remove';
+    remove.textContent = '✕';
+    remove.addEventListener('click', () => {
+      settings.preferList = settings.preferList.filter((_, i) => i !== index);
+      savePreferList();
+      renderPreferList();
+      renderPreferSuggestions(document.getElementById('prefer-search')?.value || '');
+    });
+
+    actions.append(up, down, remove);
+    row.appendChild(actions);
+    listEl.appendChild(row);
+  });
+  if (preferOpen) syncGameHeight(true);
+}
+
+function movePreferEntry(index, delta) {
+  const next = index + delta;
+  if (next < 0 || next >= settings.preferList.length) return;
+  const list = settings.preferList.slice();
+  const [item] = list.splice(index, 1);
+  list.splice(next, 0, item);
+  settings.preferList = list;
+  savePreferList();
+  renderPreferList();
+}
+
+function addPreferChampion(champ) {
+  if (!champ?.key) return;
+  if (settings.preferList.some(e => e.id === champ.key)) return;
+  settings.preferList = [...settings.preferList, { id: champ.key, name: champ.name }];
+  savePreferList();
+  renderPreferList();
+  const search = document.getElementById('prefer-search');
+  if (search) {
+    search.value = '';
+    renderPreferSuggestions('');
+    search.focus();
+  }
+}
+
+function renderPreferSuggestions(query) {
+  const box = document.getElementById('prefer-suggestions');
+  if (!box) return;
+  box.innerHTML = '';
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return;
+
+  const selected = new Set(settings.preferList.map(e => e.id));
+  const matches = preferChampions
+    .filter(c => !selected.has(c.key) && c.name.toLowerCase().includes(q))
+    .slice(0, 10);
+
+  matches.forEach(champ => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'prefer-suggest';
+    const img = document.createElement('img');
+    img.src = champSelectIconUrlPrefer(champ.key);
+    img.alt = champ.name;
+    const label = document.createElement('span');
+    label.textContent = champ.name;
+    btn.append(img, label);
+    btn.addEventListener('click', () => addPreferChampion(champ));
+    box.appendChild(btn);
+  });
+  if (preferOpen) syncGameHeight(true);
+}
+
+async function ensurePreferChampionsLoaded() {
+  if (preferChampions.length) return;
+  // Reuse already-fetched champById when available.
+  const fromCache = Object.entries(champById).map(([key, champ]) => ({
+    key: Number(key),
+    name: champ.name,
+    id: champ.id,
+  }));
+  if (fromCache.length) {
+    preferChampions = fromCache.sort((a, b) => a.name.localeCompare(b.name));
+    return;
+  }
+  try {
+    const versions = await fetch('https://ddragon.leagueoflegends.com/api/versions.json').then(r => r.json());
+    const data = await fetch(`https://ddragon.leagueoflegends.com/cdn/${versions[0]}/data/en_US/champion.json`).then(r => r.json());
+    preferChampions = Object.values(data.data || {})
+      .map(champ => ({ key: Number(champ.key), name: champ.name, id: champ.id }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (_) {
+    preferChampions = [];
+  }
+}
+
+function setPreferOpen(open) {
+  preferOpen = open;
+  document.getElementById('prefer-panel').classList.toggle('hidden', !open);
+  if (open) {
+    settingsOpen = true;
+    document.getElementById('settings-btn').classList.add('active');
+    document.getElementById('settings-panel').classList.add('hidden');
+    document.getElementById('game-screen').classList.add('hidden');
+    document.getElementById('idle-screen').classList.add('hidden');
+    document.getElementById('champ-select-screen').classList.add('hidden');
+    ensurePreferChampionsLoaded().then(() => {
+      settings.preferList = normalizePreferList(settings.preferList);
+      renderPreferList();
+      renderPreferSuggestions(document.getElementById('prefer-search')?.value || '');
+    });
+    invoke('set_focusable', { focusable: true, stealFocus: true });
+  }
+  syncGameHeight(true);
+}
 
 function toggleSettings() {
+  if (preferOpen) {
+    setPreferOpen(false);
+  }
   settingsOpen = !settingsOpen;
   document.getElementById('settings-btn').classList.toggle('active', settingsOpen);
   document.getElementById('settings-panel').classList.toggle('hidden', !settingsOpen);
+  document.getElementById('prefer-panel').classList.add('hidden');
+  preferOpen = false;
   document.getElementById('game-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'game-screen');
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'idle-screen');
   document.getElementById('champ-select-screen').classList.toggle('hidden', settingsOpen || currentScreen !== 'champ-select-screen');
@@ -227,79 +450,174 @@ fetch('https://ddragon.leagueoflegends.com/api/versions.json')
   })
   .catch(() => {});
 
-// ── Supabase room sync ──
+// ── Room cooldown sync (api.vyriv.dev WebSocket relay) ──
 
-const SUPABASE_URL = 'https://sjodltcylcxvauvgabot.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_ex94Isy1_u-qzXJWJEqeQg_9nhGkohm';
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const SUMMTRACKER_WS_BASE = 'wss://api.vyriv.dev/v1/summtracker/room';
+const SYNC_RECONNECT_MIN_MS = 1000;
+const SYNC_RECONNECT_MAX_MS = 15000;
+
 let syncRoomId = null;
-let syncChannel = null;
+let syncSocket = null;
+let syncSocketRoomId = null;
+let syncConnecting = false;
+let syncReconnectTimer = null;
+let syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
+let syncOutgoingQueue = [];
+let syncSocketGeneration = 0;
 
-async function syncToRoom(roomId) {
-  if (roomId === syncRoomId) return;
-
-  if (syncChannel) {
-    await supabase.removeChannel(syncChannel);
-    syncChannel = null;
+function clearSyncReconnectTimer() {
+  if (syncReconnectTimer != null) {
+    clearTimeout(syncReconnectTimer);
+    syncReconnectTimer = null;
   }
-
-  syncRoomId = roomId;
-
-  if (!syncRoomId) return;
-
-  const { data } = await supabase
-    .from('cooldowns')
-    .select('enemy_index, spell, started_at, duration_ms')
-    .eq('room_id', syncRoomId)
-    .gt('duration_ms', 0);
-
-  if (data) {
-    data.forEach(row => queueOrApplySyncEvent({
-      action: 'start',
-      enemyIndex: row.enemy_index,
-      spell: row.spell,
-      startedAt: row.started_at,
-      durationMs: row.duration_ms,
-    }));
-  }
-
-  syncChannel = supabase
-    .channel(`cooldowns:${syncRoomId}`)
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cooldowns', filter: `room_id=eq.${syncRoomId}` },
-      payload => queueOrApplySyncEvent({
-        action: 'start',
-        enemyIndex: payload.new.enemy_index,
-        spell: payload.new.spell,
-        startedAt: payload.new.started_at,
-        durationMs: payload.new.duration_ms,
-      }))
-    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'cooldowns', filter: `room_id=eq.${syncRoomId}` },
-      payload => queueOrApplySyncEvent({
-        action: payload.new.duration_ms > 0 ? 'start' : 'cancel',
-        enemyIndex: payload.new.enemy_index,
-        spell: payload.new.spell,
-        startedAt: payload.new.started_at,
-        durationMs: payload.new.duration_ms,
-      }))
-    .subscribe();
 }
 
-async function publishSyncEvent(action, enemyIndex, spell, startedAt, durationMs) {
+function closeSyncSocket() {
+  clearSyncReconnectTimer();
+  syncConnecting = false;
+  const socket = syncSocket;
+  syncSocket = null;
+  syncSocketRoomId = null;
+  if (!socket) return;
+  try {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    socket.close();
+  } catch (_) {
+    // ignore
+  }
+}
+
+function flushSyncOutgoingQueue() {
+  if (!syncSocket || syncSocket.readyState !== WebSocket.OPEN) return;
+  if (!syncOutgoingQueue.length) return;
+  const queued = syncOutgoingQueue.slice();
+  syncOutgoingQueue = [];
+  for (const payload of queued) {
+    try {
+      syncSocket.send(JSON.stringify(payload));
+    } catch (_) {
+      syncOutgoingQueue.push(payload);
+      break;
+    }
+  }
+}
+
+function scheduleSyncReconnect(roomId, generation) {
+  clearSyncReconnectTimer();
+  if (syncRoomId !== roomId) return;
+  syncReconnectTimer = setTimeout(() => {
+    syncReconnectTimer = null;
+    if (syncRoomId !== roomId || generation !== syncSocketGeneration) return;
+    connectSyncSocket(roomId, generation);
+  }, syncReconnectDelayMs);
+  syncReconnectDelayMs = Math.min(
+    SYNC_RECONNECT_MAX_MS,
+    Math.round(syncReconnectDelayMs * 1.7),
+  );
+}
+
+function connectSyncSocket(roomId, generation) {
+  if (!roomId || syncRoomId !== roomId || generation !== syncSocketGeneration) return;
+  if (syncSocket || syncConnecting) return;
+
+  syncConnecting = true;
+  let socket;
+  try {
+    socket = new WebSocket(`${SUMMTRACKER_WS_BASE}/${roomId}`);
+  } catch (_) {
+    syncConnecting = false;
+    scheduleSyncReconnect(roomId, generation);
+    return;
+  }
+
+  syncSocket = socket;
+  syncSocketRoomId = roomId;
+
+  socket.onopen = () => {
+    if (generation !== syncSocketGeneration || syncRoomId !== roomId || syncSocket !== socket) {
+      try { socket.close(); } catch (_) {}
+      return;
+    }
+    syncConnecting = false;
+    syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
+    flushSyncOutgoingQueue();
+  };
+
+  socket.onmessage = (event) => {
+    if (generation !== syncSocketGeneration || syncRoomId !== roomId || syncSocket !== socket) {
+      return;
+    }
+    let payload;
+    try {
+      payload = typeof event.data === 'string' ? JSON.parse(event.data) : null;
+    } catch (_) {
+      return;
+    }
+    if (!payload || typeof payload !== 'object') return;
+    queueOrApplySyncEvent(payload);
+  };
+
+  socket.onerror = () => {
+    // onclose handles reconnect.
+  };
+
+  socket.onclose = () => {
+    if (syncSocket === socket) {
+      syncSocket = null;
+      syncSocketRoomId = null;
+    }
+    syncConnecting = false;
+    if (generation !== syncSocketGeneration || syncRoomId !== roomId) return;
+    scheduleSyncReconnect(roomId, generation);
+  };
+}
+
+function syncToRoom(roomId) {
+  const nextRoomId = roomId || null;
+  if (nextRoomId === syncRoomId) {
+    if (nextRoomId && !syncSocket && !syncConnecting && !syncReconnectTimer) {
+      const generation = ++syncSocketGeneration;
+      syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
+      connectSyncSocket(nextRoomId, generation);
+    }
+    return;
+  }
+
+  closeSyncSocket();
+  syncOutgoingQueue = [];
+  syncRoomId = nextRoomId;
+  syncReconnectDelayMs = SYNC_RECONNECT_MIN_MS;
+
   if (!syncRoomId) return;
 
-  const match = { room_id: syncRoomId, enemy_index: enemyIndex, spell };
-  const { data: existing } = await supabase
-    .from('cooldowns').select('id').match(match)
-    .order('updated_at', { ascending: false }).limit(1);
+  const generation = ++syncSocketGeneration;
+  connectSyncSocket(syncRoomId, generation);
+}
 
-  const nextValues = action === 'start'
-    ? { ...match, started_at: startedAt, duration_ms: durationMs, updated_at: new Date().toISOString() }
-    : { started_at: 0, duration_ms: 0, updated_at: new Date().toISOString() };
+function publishSyncEvent(action, enemyIndex, spell, startedAt, durationMs) {
+  if (!syncRoomId) return;
 
-  if (existing?.length) {
-    await supabase.from('cooldowns').update(nextValues).eq('id', existing[0].id);
-  } else if (action === 'start') {
-    await supabase.from('cooldowns').insert(nextValues);
+  const payload = { action, enemyIndex, spell };
+  if (action === 'start') {
+    payload.startedAt = startedAt;
+    payload.durationMs = durationMs;
+  }
+
+  if (syncSocket && syncSocket.readyState === WebSocket.OPEN && syncSocketRoomId === syncRoomId) {
+    try {
+      syncSocket.send(JSON.stringify(payload));
+      return;
+    } catch (_) {
+      // fall through to queue
+    }
+  }
+
+  syncOutgoingQueue.push(payload);
+  if (syncOutgoingQueue.length > 64) {
+    syncOutgoingQueue = syncOutgoingQueue.slice(-64);
   }
 }
 
@@ -599,10 +917,13 @@ function renderPlayers(players) {
 }
 
 function showScreen(id) {
+  if (preferOpen) setPreferOpen(false);
   currentScreen = id;
   document.getElementById('idle-screen').classList.toggle('hidden', settingsOpen || id !== 'idle-screen');
   document.getElementById('game-screen').classList.toggle('hidden', settingsOpen || id !== 'game-screen');
   document.getElementById('champ-select-screen').classList.toggle('hidden', settingsOpen || id !== 'champ-select-screen');
+  document.getElementById('prefer-panel').classList.add('hidden');
+  preferOpen = false;
 }
 
 function champName(id) {
@@ -626,7 +947,7 @@ let queuedBenchSwap = null;
 let queuedBenchSwapInFlight = false;
 let queuedBenchSwapTimer = null;
 let queuedBenchMissingTicks = 0;
-const QUEUED_SWAP_RETRY_MS = 16;
+const QUEUED_SWAP_RETRY_MS = 8;
 const QUEUED_SWAP_MISSING_GRACE = 12;
 
 function makeChampTile(championId, title, className = '') {
@@ -648,6 +969,7 @@ async function clickChampSelectChampion(championId) {
   const session = lastChampSelect;
   champSelectBusy = true;
   try {
+    await invoke('suppress_prefer_list', { championId });
     await invoke('complete_pick', { actionId: session?.pickActionId ?? -1, championId });
     setChampSelectStatus(`Picked ${champName(championId)}`, 'ok');
   } catch (err) {
@@ -782,13 +1104,15 @@ async function clickAllyTrade(ally) {
   const latest = lastChampSelect?.allies?.find(a => a.cellId === ally.cellId) || ally;
   if (latest?.tradeId == null) return;
   const state = String(latest.tradeState || '').toUpperCase();
-  const kind = latest.tradeKind || 'trade';
+  const kind = latest.tradeKind || 'champion-swap';
+  if (state !== 'RECEIVED' && state !== 'AVAILABLE') return;
   champSelectBusy = true;
   try {
+    await invoke('suppress_prefer_list', { championId: latest.championId || null });
     if (state === 'RECEIVED') {
       await invoke('accept_trade', { tradeId: latest.tradeId, kind });
       setChampSelectStatus(`Accepted trade for ${champName(latest.championId)}`, 'ok');
-    } else if (state === 'AVAILABLE') {
+    } else {
       await invoke('request_trade', { tradeId: latest.tradeId, kind });
       setChampSelectStatus(`Trade requested for ${champName(latest.championId)}`, 'ok');
     }
@@ -806,9 +1130,65 @@ function champSelectKey(data) {
     pick: data.pickActionId,
     bench: data.bench,
     cards: data.cards,
+    prefer: data.preferTargetId || 0,
     allies: (data.allies || []).map(a => [
       a.cellId, a.championId, a.tradeState, a.tradeId, a.displayName, a.tradeKind,
     ]),
+  });
+}
+
+function champSelectBenchKey(data) {
+  return JSON.stringify({
+    bench: data.bench,
+    prefer: data.preferTargetId || 0,
+    my: data.myChampionId || 0,
+    queued: queuedBenchSwap?.championId || 0,
+  });
+}
+
+function champSelectAlliesKey(data) {
+  return JSON.stringify({
+    my: data.myChampionId,
+    pick: data.pickActionId,
+    cards: data.cards,
+    phase: data.phase,
+    allies: (data.allies || []).map(a => [
+      a.cellId, a.championId, a.tradeState, a.tradeId, a.displayName, a.tradeKind,
+    ]),
+  });
+}
+
+let lastChampSelectBenchKey = '';
+let lastChampSelectAlliesKey = '';
+
+function renderChampSelectBench(data) {
+  const bench = Array.isArray(data.bench) ? data.bench.filter(id => id > 0) : [];
+  const benchWrap = document.getElementById('cs-bench-wrap');
+  const benchEl = document.getElementById('cs-bench');
+  benchEl.innerHTML = '';
+  benchWrap.classList.toggle('hidden', bench.length === 0);
+  const preferTargetId = Number(data.preferTargetId || 0);
+  const preferActive = preferTargetId > 0
+    && preferTargetId !== (data.myChampionId || 0)
+    && bench.includes(preferTargetId)
+    && !queuedBenchSwap;
+  if (preferActive) {
+    setChampSelectStatus(`Prefer: ${champName(preferTargetId)}`, 'queued');
+  } else if (!queuedBenchSwap && document.getElementById('cs-status')?.classList.contains('queued')) {
+    const text = document.getElementById('cs-status').textContent || '';
+    if (text.startsWith('Prefer:')) setChampSelectStatus('', '');
+  }
+  bench.forEach(id => {
+    const isQueued = queuedBenchSwap?.championId === id || (preferActive && preferTargetId === id);
+    const classes = [isQueued ? 'queued' : '', isQueued ? 'locked' : ''].filter(Boolean).join(' ');
+    const title = queuedBenchSwap?.championId === id
+      ? `Queued ${champName(id)} (swaps when unlocked)`
+      : preferActive && preferTargetId === id
+        ? `Prefer target: ${champName(id)}`
+        : `Swap to ${champName(id)} (queues if locked)`;
+    const tile = makeChampTile(id, title, classes);
+    tile.addEventListener('click', () => queueBenchSwap(id));
+    benchEl.appendChild(tile);
   });
 }
 
@@ -823,106 +1203,104 @@ function renderChampSelect(data) {
   const modeLabel = document.getElementById('cs-mode-label');
   modeLabel.textContent = data.mode || 'ARAM';
 
-  const youEl = document.getElementById('cs-you');
-  youEl.innerHTML = '';
-  const myId = data.myChampionId || 0;
-  if (myId) {
-    const tile = makeChampTile(myId, champName(myId), 'local');
-    youEl.appendChild(tile);
-    const name = document.createElement('div');
-    name.className = 'player-info';
-    name.innerHTML = `<div class="player-name">${champName(myId)}</div><div class="champion-name">You</div>`;
-    youEl.appendChild(name);
-  } else {
-    const waiting = document.createElement('div');
-    waiting.className = 'champion-name';
-    waiting.textContent = data.pickActionId != null ? 'Pick one of your cards' : 'Waiting for champion...';
-    youEl.appendChild(waiting);
-  }
+  const alliesKey = champSelectAlliesKey(data);
+  const benchKey = champSelectBenchKey(data);
+  const alliesChanged = alliesKey !== lastChampSelectAlliesKey;
+  const benchChanged = benchKey !== lastChampSelectBenchKey;
 
-  const cards = Array.isArray(data.cards) ? data.cards.filter(id => id > 0) : [];
-  const cardsWrap = document.getElementById('cs-cards-wrap');
-  const cardsEl = document.getElementById('cs-cards');
-  cardsEl.innerHTML = '';
-  const phase = String(data.phase || '').toUpperCase();
-  const needsPick = data.pickActionId != null || phase.includes('CARD') || phase.includes('PICK');
-  const showCards = cards.length > 0 && needsPick && !myId;
-  cardsWrap.classList.toggle('hidden', !showCards);
-  if (showCards) {
-    cards.forEach(id => {
-      const tile = makeChampTile(id, `Pick ${champName(id)}`);
-      tile.addEventListener('click', () => clickChampSelectChampion(id));
-      cardsEl.appendChild(tile);
+  if (alliesChanged) {
+    lastChampSelectAlliesKey = alliesKey;
+    const youEl = document.getElementById('cs-you');
+    youEl.innerHTML = '';
+    const myId = data.myChampionId || 0;
+    if (myId) {
+      const tile = makeChampTile(myId, champName(myId), 'local');
+      youEl.appendChild(tile);
+      const name = document.createElement('div');
+      name.className = 'player-info';
+      name.innerHTML = `<div class="player-name">${champName(myId)}</div><div class="champion-name">You</div>`;
+      youEl.appendChild(name);
+    } else {
+      const waiting = document.createElement('div');
+      waiting.className = 'champion-name';
+      waiting.textContent = data.pickActionId != null ? 'Pick one of your cards' : 'Waiting for champion...';
+      youEl.appendChild(waiting);
+    }
+
+    const cards = Array.isArray(data.cards) ? data.cards.filter(id => id > 0) : [];
+    const cardsWrap = document.getElementById('cs-cards-wrap');
+    const cardsEl = document.getElementById('cs-cards');
+    cardsEl.innerHTML = '';
+    const phase = String(data.phase || '').toUpperCase();
+    const needsPick = data.pickActionId != null || phase.includes('CARD') || phase.includes('PICK');
+    const showCards = cards.length > 0 && needsPick && !myId;
+    cardsWrap.classList.toggle('hidden', !showCards);
+    if (showCards) {
+      cards.forEach(id => {
+        const tile = makeChampTile(id, `Pick ${champName(id)}`);
+        tile.addEventListener('click', () => clickChampSelectChampion(id));
+        cardsEl.appendChild(tile);
+      });
+    }
+
+    const alliesEl = document.getElementById('cs-allies');
+    alliesEl.innerHTML = '';
+    (data.allies || []).forEach(ally => {
+      if (ally.isLocal) return;
+      const row = document.createElement('div');
+      row.className = 'ally-row';
+      const state = String(ally.tradeState || '').toUpperCase();
+
+      const img = document.createElement('img');
+      img.className = 'champion-icon';
+      img.src = ally.championId ? champSelectIconUrl(ally.championId) : '';
+      img.alt = champName(ally.championId);
+      if (state === 'AVAILABLE' || state === 'RECEIVED') {
+        img.style.cursor = 'pointer';
+        img.addEventListener('click', () => clickAllyTrade(ally));
+      }
+      row.appendChild(img);
+
+      const info = document.createElement('div');
+      info.className = 'player-info';
+      const nameEl = document.createElement('div');
+      nameEl.className = 'player-name';
+      nameEl.textContent = ally.displayName || champName(ally.championId);
+      const champEl = document.createElement('div');
+      champEl.className = 'champion-name';
+      champEl.textContent = champName(ally.championId);
+      info.appendChild(nameEl);
+      info.appendChild(champEl);
+      row.appendChild(info);
+
+      const action = document.createElement('button');
+      action.type = 'button';
+      action.className = 'ally-action';
+      if (state === 'RECEIVED') {
+        action.textContent = 'Accept';
+        action.classList.add('accept');
+        action.addEventListener('click', () => clickAllyTrade(ally));
+      } else if (state === 'SENT') {
+        action.textContent = 'Sent';
+        action.disabled = true;
+      } else if (state === 'AVAILABLE') {
+        action.textContent = 'Trade';
+        action.addEventListener('click', () => clickAllyTrade(ally));
+      } else {
+        action.textContent = state === 'BUSY' ? 'Busy' : 'Locked';
+        action.disabled = true;
+      }
+      row.appendChild(action);
+      alliesEl.appendChild(row);
     });
   }
 
-  const alliesEl = document.getElementById('cs-allies');
-  alliesEl.innerHTML = '';
-  (data.allies || []).forEach(ally => {
-    if (ally.isLocal) return;
-    const row = document.createElement('div');
-    row.className = 'ally-row';
-    const state = String(ally.tradeState || '').toUpperCase();
+  if (benchChanged) {
+    lastChampSelectBenchKey = benchKey;
+    renderChampSelectBench(data);
+  }
 
-    const img = document.createElement('img');
-    img.className = 'champion-icon';
-    img.src = ally.championId ? champSelectIconUrl(ally.championId) : '';
-    img.alt = champName(ally.championId);
-    if (state === 'AVAILABLE' || state === 'RECEIVED') {
-      img.style.cursor = 'pointer';
-      img.addEventListener('click', () => clickAllyTrade(ally));
-    }
-    row.appendChild(img);
-
-    const info = document.createElement('div');
-    info.className = 'player-info';
-    const nameEl = document.createElement('div');
-    nameEl.className = 'player-name';
-    nameEl.textContent = ally.displayName || champName(ally.championId);
-    const champEl = document.createElement('div');
-    champEl.className = 'champion-name';
-    champEl.textContent = champName(ally.championId);
-    info.appendChild(nameEl);
-    info.appendChild(champEl);
-    row.appendChild(info);
-
-    const action = document.createElement('button');
-    action.type = 'button';
-    action.className = 'ally-action';
-    if (state === 'RECEIVED') {
-      action.textContent = 'Accept';
-      action.classList.add('accept');
-      action.addEventListener('click', () => clickAllyTrade(ally));
-    } else if (state === 'SENT') {
-      action.textContent = 'Sent';
-      action.disabled = true;
-    } else if (state === 'AVAILABLE') {
-      action.textContent = 'Trade';
-      action.addEventListener('click', () => clickAllyTrade(ally));
-    } else {
-      action.textContent = state === 'BUSY' ? 'Busy' : 'Locked';
-      action.disabled = true;
-    }
-    row.appendChild(action);
-    alliesEl.appendChild(row);
-  });
-
-  const bench = Array.isArray(data.bench) ? data.bench.filter(id => id > 0) : [];
-  const benchWrap = document.getElementById('cs-bench-wrap');
-  const benchEl = document.getElementById('cs-bench');
-  benchEl.innerHTML = '';
-  benchWrap.classList.toggle('hidden', bench.length === 0);
-  bench.forEach(id => {
-    const isQueued = queuedBenchSwap?.championId === id;
-    const classes = [isQueued ? 'queued' : '', isQueued ? 'locked' : ''].filter(Boolean).join(' ');
-    const title = isQueued
-      ? `Queued ${champName(id)} (swaps when unlocked)`
-      : `Swap to ${champName(id)} (queues if locked)`;
-    const tile = makeChampTile(id, title, classes);
-    tile.addEventListener('click', () => queueBenchSwap(id));
-    benchEl.appendChild(tile);
-  });
-  return true;
+  return alliesChanged || benchChanged;
 }
 
 function applySyncCooldownEvent(event) {
@@ -959,18 +1337,22 @@ function handleGameData(data) {
     syncToRoom(data.roomId || null);
   } else if (data.state === 'champ-select' && data.benchEnabled) {
     const entering = !document.body.classList.contains('champ-select-active');
-    resetAllCooldowns();
-    enemyPlayerIndices = [];
-    pendingSyncEvents = [];
-    syncToRoom(null);
+    if (entering) {
+      resetAllCooldowns();
+      enemyPlayerIndices = [];
+      pendingSyncEvents = [];
+      syncToRoom(null);
+      document.body.classList.add('champ-select-active');
+      showScreen('champ-select-screen');
+      // Only once on enter. Polling this every tick made clicks feel laggy.
+      invoke('set_focusable', { focusable: true, stealFocus: false });
+    }
     const layoutChanged = renderChampSelect(data);
     if (queuedBenchSwap) attemptQueuedBenchSwap();
-    document.getElementById('titlebar-label').textContent = data.mode || 'ARAM';
-    showScreen('champ-select-screen');
-    document.body.classList.add('champ-select-active');
-    // Interactive for trades, cards, and bench clicks without stealing League focus each poll.
-    invoke('set_focusable', { focusable: true, stealFocus: false });
-    if (entering || layoutChanged) syncGameHeight(entering);
+    if (entering || layoutChanged) {
+      document.getElementById('titlebar-label').textContent = data.mode || 'ARAM';
+      syncGameHeight(entering);
+    }
   } else {
     clearQueuedBenchSwap();
     document.body.classList.remove('champ-select-active');
@@ -982,6 +1364,8 @@ function handleGameData(data) {
     showScreen('idle-screen');
     lastChampSelect = null;
     lastChampSelectKey = '';
+    lastChampSelectBenchKey = '';
+    lastChampSelectAlliesKey = '';
     if (!settingsOpen) invoke('set_focusable', { focusable: false, stealFocus: false });
   }
 }
@@ -1049,9 +1433,11 @@ listen('player-cooldowns', (event) => {
 
 invoke('load_settings').then(saved => {
   settings = { ...DEFAULT_SETTINGS, ...saved };
+  settings.preferList = normalizePreferList(settings.preferList);
   initSettingsPanel();
   applySettings();
   invoke('update_collapse_bind', { bind: settings.collapseBind });
+  invoke('close_prefer_list_window').catch(() => {});
   invoke('set_focusable', { focusable: false, stealFocus: false });
   invoke('get_latest_game_data').then(handleGameData).catch(() => {});
 });

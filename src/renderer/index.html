@@ -52,12 +52,31 @@
           <label class="toggle"><input type="checkbox" id="s-auto-accept"><span class="slider"></span></label>
         </div>
         <div class="setting-row">
+          <span class="setting-label">Prefer list</span>
+          <button id="s-prefer-list" class="bind-btn">Edit</button>
+        </div>
+        <div class="setting-row">
           <span class="setting-label">Background opacity</span>
           <div class="opacity-control">
             <input type="range" id="s-opacity" min="0" max="100" step="5" value="90" />
             <span id="s-opacity-value">90%</span>
           </div>
         </div>
+      </div>
+
+      <div id="prefer-panel" class="screen hidden">
+        <div class="prefer-header">
+          <button id="prefer-back" class="bind-btn">Back</button>
+          <div class="team-label">Prefer list</div>
+        </div>
+        <p class="prefer-hint">Higher on the list wins. If several are on the bench, the top one is taken.</p>
+        <div class="prefer-search-wrap">
+          <input id="prefer-search" type="text" placeholder="Search champions..." autocomplete="off" spellcheck="false" />
+        </div>
+        <div id="prefer-suggestions" class="prefer-suggestions"></div>
+        <div class="team-label">Your priority list</div>
+        <div id="prefer-list" class="prefer-list"></div>
+        <div id="prefer-empty" class="prefer-empty">No champions yet. Search above to add some.</div>
       </div>
 
       <div id="idle-screen" class="screen">
